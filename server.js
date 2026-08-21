@@ -5,7 +5,8 @@ const rateLimit = require("express-rate-limit");
 
 const {
     registerUser,
-    verifyPasswordHash
+    verifyPasswordHash,
+    hashPassword
 } = require("./register-backend");
 
 require("./firebase");
@@ -394,7 +395,210 @@ app.post("/api/login", async (req, res) => {
     }
 
 });
+/* =========================================================
+   RESET PASSWORD
+   ========================================================= */
 
+app.post("/api/reset-password", async (req, res) => {
+
+    try {
+
+        const {
+            idToken,
+            newPassword
+        } = req.body || {};
+
+
+        /* -------------------------------------------------
+           BASIC VALIDATION
+        ------------------------------------------------- */
+
+        if (!idToken) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Phone verification is required."
+            });
+
+        }
+
+
+        if (!newPassword) {
+
+            return res.status(400).json({
+                success: false,
+                message: "A new password is required."
+            });
+
+        }
+
+
+        if (newPassword.length < 8) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your new password must be at least 8 characters."
+            });
+
+        }
+
+
+        /* -------------------------------------------------
+           VERIFY FIREBASE PHONE SESSION
+        ------------------------------------------------- */
+
+        let decodedToken;
+
+        try {
+
+            decodedToken =
+                await auth.verifyIdToken(idToken);
+
+        } catch (error) {
+
+            console.error(
+                "Password reset token verification failed:",
+                error
+            );
+
+            return res.status(401).json({
+                success: false,
+                message:
+                    "Your verification has expired. Please try again."
+            });
+
+        }
+
+
+        /* -------------------------------------------------
+           GET VERIFIED USER
+        ------------------------------------------------- */
+
+        const uid =
+            decodedToken.uid;
+
+        const phoneNumber =
+            decodedToken.phone_number;
+
+
+        if (!phoneNumber) {
+
+            return res.status(400).json({
+                success: false,
+                message:
+                    "A verified phone number is required."
+            });
+
+        }
+
+
+        /* -------------------------------------------------
+           FIND NOVAPAY ACCOUNT
+        ------------------------------------------------- */
+
+        const userRef =
+            db
+                .collection("novapayUsers")
+                .doc(uid);
+
+        const userDoc =
+            await userRef.get();
+
+
+        if (!userDoc.exists) {
+
+            return res.status(404).json({
+                success: false,
+                message:
+                    "We couldn't find a NovaPay account for this phone number."
+            });
+
+        }
+
+
+        const user =
+            userDoc.data();
+
+
+        /* -------------------------------------------------
+           MAKE SURE PHONE MATCHES
+        ------------------------------------------------- */
+
+        if (
+            user.phoneNumber !== phoneNumber
+        ) {
+
+            return res.status(403).json({
+                success: false,
+                message:
+                    "We couldn't verify this account."
+            });
+
+        }
+
+
+        /* -------------------------------------------------
+           HASH NEW PASSWORD
+        ------------------------------------------------- */
+
+        const passwordData =
+            await hashPassword(newPassword);
+
+
+        /* -------------------------------------------------
+           UPDATE PASSWORD
+        ------------------------------------------------- */
+
+        await userRef.update({
+
+            passwordHash:
+                passwordData.hash,
+
+            passwordSalt:
+                passwordData.salt,
+
+            updatedAt:
+                require("firebase-admin/firestore")
+                    .FieldValue
+                    .serverTimestamp()
+
+        });
+
+
+        /* -------------------------------------------------
+           SUCCESS
+        ------------------------------------------------- */
+
+        return res.status(200).json({
+
+            success: true,
+
+            message:
+                "Your NovaPay password has been updated successfully."
+
+        });
+
+
+    } catch (error) {
+
+        console.error(
+            "NovaPay password reset error:",
+            error
+        );
+
+
+        return res.status(500).json({
+
+            success: false,
+
+            message:
+                "We couldn't update your password right now. Please try again."
+
+        });
+
+    }
+
+});
 
 /* =========================================================
    SERVER
