@@ -1,0 +1,29 @@
+[debug] [2026-08-19T08:20:49.624Z] ----------------------------------------------------------------------
+[debug] [2026-08-19T08:20:49.626Z] Command:       /usr/local/share/nvm/versions/node/v24.14.0/bin/node /home/codespace/nvm/current/bin/firebase login --no-localhost
+[debug] [2026-08-19T08:20:49.626Z] CLI Version:   15.27.0
+[debug] [2026-08-19T08:20:49.627Z] Platform:      linux
+[debug] [2026-08-19T08:20:49.627Z] Node Version:  v24.14.0
+[debug] [2026-08-19T08:20:49.627Z] Detected Agent: unknown
+[debug] [2026-08-19T08:20:49.627Z] Time:          Wed Aug 19 2026 08:20:49 GMT+0000 (Coordinated Universal Time)
+[debug] [2026-08-19T08:20:49.627Z] ----------------------------------------------------------------------
+[debug] 
+[info] i  The Firebase CLI’s MCP server feature can optionally make use of Gemini in Firebase. Learn more about Gemini in Firebase and how it uses your data: https://firebase.google.com/docs/gemini-in-firebase#how-gemini-in-firebase-uses-your-data 
+[info] 
+[info] i  Firebase optionally collects CLI and Emulator Suite usage and error reporting information to help improve our products. Data is collected in accordance with Google's privacy policy (https://policies.google.com/privacy) and is not used to identify you. 
+[debug] [2026-08-19T08:21:23.532Z] >>> [apiv2][query] POST https://auth.firebase.tools/attest [none]
+[debug] [2026-08-19T08:21:23.532Z] >>> [apiv2][body] POST https://auth.firebase.tools/attest {"session_id":"2f48fd1a-9869-4d5c-ae6e-1b6c5c37858f"}
+[debug] [2026-08-19T08:21:23.810Z] <<< [apiv2][status] POST https://auth.firebase.tools/attest 200
+[debug] [2026-08-19T08:21:23.810Z] <<< [apiv2][body] POST https://auth.firebase.tools/attest {"token":"lNsciCqFrgQIMpxcqzTGvFpAlBEbS69y4fAPADqsRCE"}
+[info] 
+[info] To sign in to the Firebase CLI:
+[info] 
+[info] 1. Take note of your session ID:
+[info] 
+[info]    2F48F
+[info] 
+[info] 2. Visit the URL below on any device and follow the instructions to get your code:
+[info] 
+[info]    https://auth.firebase.tools/login?code_challenge=L_AVmFhqi645WDyG2yDym_vs7FrvtPlkSjIxm3AaiJQ&session=2f48fd1a-9869-4d5c-ae6e-1b6c5c37858f&attest=lNsciCqFrgQIMpxcqzTGvFpAlBEbS69y4fAPADqsRCE
+[info] 
+[info] 3. Paste or enter the authorization code below once you have it:
+[info] 
