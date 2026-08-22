@@ -21,6 +21,7 @@ const {
     FieldValue
 } = require("firebase-admin/firestore");
 
+
 const app = express();
 
 const auth = getAuth();
@@ -40,12 +41,10 @@ app.use(cors({
 
 
 /* =========================================================
-   PAYSTACK HELPERS
-========================================================= */
-
-/*
-   This function is the ONLY place that actually credits
-   a NovaPay wallet from a Paystack payment.
+   PAYSTACK WALLET CREDIT
+   ---------------------------------------------------------
+   This is the ONLY function allowed to credit a wallet
+   from a Paystack payment.
 
    Both:
    - Paystack webhook
@@ -53,9 +52,8 @@ app.use(cors({
 
    use this same function.
 
-   This prevents different payment paths from having
-   different wallet-credit rules.
-*/
+   This prevents duplicate wallet credits.
+========================================================= */
 
 async function creditPaystackPayment(
     payment,
@@ -65,26 +63,28 @@ async function creditPaystackPayment(
     if (!payment) {
         return {
             credited: false,
+            alreadyCredited: false,
             reason: "missing_payment"
         };
     }
 
 
     const reference =
-        payment.reference;
+        String(payment.reference || "").trim();
 
 
     if (!reference) {
         return {
             credited: false,
+            alreadyCredited: false,
             reason: "missing_reference"
         };
     }
 
 
-    /* -----------------------------------------
+    /* ---------------------------------------------------------
        REFERENCE CHECK
-    ----------------------------------------- */
+    --------------------------------------------------------- */
 
     if (
         expectedReference &&
@@ -99,6 +99,7 @@ async function creditPaystackPayment(
 
         return {
             credited: false,
+            alreadyCredited: false,
             reason: "reference_mismatch"
         };
     }
@@ -126,9 +127,9 @@ async function creditPaystackPayment(
                 );
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                PAYMENT MUST EXIST
-            --------------------------------- */
+            ------------------------------------------------- */
 
             if (!paymentDoc.exists) {
 
@@ -139,6 +140,7 @@ async function creditPaystackPayment(
 
                 result = {
                     credited: false,
+                    alreadyCredited: false,
                     reason: "payment_not_found"
                 };
 
@@ -150,9 +152,9 @@ async function creditPaystackPayment(
                 paymentDoc.data();
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                PREVENT DOUBLE CREDIT
-            --------------------------------- */
+            ------------------------------------------------- */
 
             if (
                 savedPayment.status ===
@@ -169,9 +171,9 @@ async function creditPaystackPayment(
             }
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                PAYMENT MUST BE SUCCESSFUL
-            --------------------------------- */
+            ------------------------------------------------- */
 
             if (
                 payment.status !==
@@ -180,6 +182,7 @@ async function creditPaystackPayment(
 
                 result = {
                     credited: false,
+                    alreadyCredited: false,
                     reason: "payment_not_successful"
                 };
 
@@ -187,14 +190,14 @@ async function creditPaystackPayment(
             }
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                CURRENCY CHECK
-            --------------------------------- */
+            ------------------------------------------------- */
 
             if (
-                String(payment.currency)
-                    .toUpperCase() !==
-                "NGN"
+                String(
+                    payment.currency || ""
+                ).toUpperCase() !== "NGN"
             ) {
 
                 console.error(
@@ -204,6 +207,7 @@ async function creditPaystackPayment(
 
                 result = {
                     credited: false,
+                    alreadyCredited: false,
                     reason: "invalid_currency"
                 };
 
@@ -211,12 +215,14 @@ async function creditPaystackPayment(
             }
 
 
-            /* ---------------------------------
-               AMOUNT CHECK
-            --------------------------------- */
+            /* -------------------------------------------------
+               PAYSTACK AMOUNT
+               Paystack amount is in kobo.
+            ------------------------------------------------- */
 
             const paystackAmount =
                 Number(payment.amount);
+
 
             const expectedAmount =
                 Number(
@@ -237,11 +243,16 @@ async function creditPaystackPayment(
 
                 console.error(
                     "Paystack amount mismatch:",
-                    reference
+                    {
+                        reference,
+                        paystackAmount,
+                        expectedAmount
+                    }
                 );
 
                 result = {
                     credited: false,
+                    alreadyCredited: false,
                     reason: "amount_mismatch"
                 };
 
@@ -249,12 +260,14 @@ async function creditPaystackPayment(
             }
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                USER UID CHECK
-            --------------------------------- */
+            ------------------------------------------------- */
 
             const uid =
-                savedPayment.uid;
+                String(
+                    savedPayment.uid || ""
+                ).trim();
 
 
             if (!uid) {
@@ -266,6 +279,7 @@ async function creditPaystackPayment(
 
                 result = {
                     credited: false,
+                    alreadyCredited: false,
                     reason: "missing_user"
                 };
 
@@ -273,9 +287,9 @@ async function creditPaystackPayment(
             }
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                USER WALLET
-            --------------------------------- */
+            ------------------------------------------------- */
 
             const userRef =
                 db
@@ -290,7 +304,6 @@ async function creditPaystackPayment(
 
 
             if (!userDoc.exists) {
-
                 throw new Error(
                     "NovaPay user does not exist."
                 );
@@ -320,13 +333,29 @@ async function creditPaystackPayment(
             }
 
 
+            /* -------------------------------------------------
+               CONVERT KOBO → NAIRA
+            ------------------------------------------------- */
+
             const amountNaira =
                 Number(
                     (
-                        paystackAmount /
-                        100
+                        paystackAmount / 100
                     ).toFixed(2)
                 );
+
+
+            if (
+                !Number.isFinite(
+                    amountNaira
+                ) ||
+                amountNaira <= 0
+            ) {
+
+                throw new Error(
+                    "Invalid payment amount."
+                );
+            }
 
 
             const newBalance =
@@ -350,14 +379,13 @@ async function creditPaystackPayment(
             }
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                UPDATE WALLET
-            --------------------------------- */
+            ------------------------------------------------- */
 
             transaction.update(
                 userRef,
                 {
-
                     walletBalance:
                         newBalance,
 
@@ -368,9 +396,9 @@ async function creditPaystackPayment(
             );
 
 
-            /* ---------------------------------
-               SAVE TRANSACTION
-            --------------------------------- */
+            /* -------------------------------------------------
+               SAVE NOVAPAY TRANSACTION
+            ------------------------------------------------- */
 
             const transactionRef =
                 db
@@ -383,7 +411,6 @@ async function creditPaystackPayment(
             transaction.set(
                 transactionRef,
                 {
-
                     uid:
                         uid,
 
@@ -413,14 +440,13 @@ async function creditPaystackPayment(
             );
 
 
-            /* ---------------------------------
+            /* -------------------------------------------------
                MARK PAYMENT CREDITED
-            --------------------------------- */
+            ------------------------------------------------- */
 
             transaction.update(
                 paymentRef,
                 {
-
                     status:
                         "credited",
 
@@ -455,14 +481,17 @@ async function creditPaystackPayment(
 
 /* =========================================================
    PAYSTACK WEBHOOK
+   ---------------------------------------------------------
    MUST COME BEFORE express.json()
 ========================================================= */
 
 app.post(
     "/api/payments/webhook",
+
     express.raw({
         type: "application/json"
     }),
+
     async (req, res) => {
 
         try {
@@ -471,6 +500,7 @@ app.post(
                 req.headers[
                     "x-paystack-signature"
                 ];
+
 
             const secret =
                 process.env.PAYSTACK_SECRET_KEY;
@@ -487,14 +517,13 @@ app.post(
 
 
             if (!signature) {
-
                 return res.sendStatus(401);
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                VERIFY PAYSTACK SIGNATURE
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const expectedSignature =
                 crypto
@@ -511,6 +540,7 @@ app.post(
                     String(signature),
                     "utf8"
                 );
+
 
             const expectedBuffer =
                 Buffer.from(
@@ -536,11 +566,12 @@ app.post(
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                PARSE PAYLOAD
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             let event;
+
 
             try {
 
@@ -562,9 +593,9 @@ app.post(
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                ONLY SUCCESSFUL PAYMENTS
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             if (
                 event.event !==
@@ -580,14 +611,13 @@ app.post(
 
 
             if (!payment) {
-
                 return res.sendStatus(200);
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                CREDIT WALLET
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const result =
                 await creditPaystackPayment(
@@ -601,17 +631,7 @@ app.post(
             );
 
 
-            /*
-               Returning 200 tells Paystack that the
-               webhook was received.
-
-               If the payment was already credited,
-               we still return 200 because there is
-               nothing else to credit.
-            */
-
             return res.sendStatus(200);
-
 
         } catch (error) {
 
@@ -670,14 +690,10 @@ app.get(
     (req, res) => {
 
         res.json({
-
-            success:
-                true,
-
+            success: true,
             message:
                 "NovaPay backend is running."
         });
-
     }
 );
 
@@ -688,6 +704,7 @@ app.get(
 
 app.post(
     "/api/register",
+
     async (req, res) => {
 
         try {
@@ -702,10 +719,7 @@ app.post(
             if (!idToken) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Phone verification is required."
                 });
@@ -715,10 +729,7 @@ app.post(
             if (!username) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Username is required."
                 });
@@ -728,10 +739,7 @@ app.post(
             if (!password) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Password is required."
                 });
@@ -740,7 +748,6 @@ app.post(
 
             const result =
                 await registerUser({
-
                     idToken:
                         idToken,
 
@@ -753,9 +760,7 @@ app.post(
 
 
             return res.status(201).json({
-
-                success:
-                    true,
+                success: true,
 
                 message:
                     "Account created successfully.",
@@ -764,7 +769,6 @@ app.post(
                     result.uid
             });
 
-
         } catch (error) {
 
             console.error(
@@ -772,11 +776,8 @@ app.post(
                 error
             );
 
-
             return res.status(400).json({
-
-                success:
-                    false,
+                success: false,
 
                 message:
                     error.message ||
@@ -794,6 +795,7 @@ app.post(
 
 app.post(
     "/api/login",
+
     async (req, res) => {
 
         try {
@@ -807,10 +809,7 @@ app.post(
             if (!phone) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Phone number is required."
                 });
@@ -820,19 +819,16 @@ app.post(
             if (!password) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Password is required."
                 });
             }
 
 
-            /* -----------------------------------------
-               NORMALIZE PHONE
-            ----------------------------------------- */
+            /* -------------------------------------------------
+               NORMALIZE NIGERIAN PHONE
+            ------------------------------------------------- */
 
             let normalizedPhone =
                 String(phone)
@@ -864,9 +860,9 @@ app.post(
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                FIND USER
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const userQuery =
                 await db
@@ -885,10 +881,7 @@ app.post(
             if (userQuery.empty) {
 
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Incorrect phone number or password."
                 });
@@ -897,6 +890,7 @@ app.post(
 
             const userDoc =
                 userQuery.docs[0];
+
 
             const user =
                 userDoc.data();
@@ -912,12 +906,8 @@ app.post(
                     userDoc.id
                 );
 
-
                 return res.status(500).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "This account cannot be logged in at the moment."
                 });
@@ -935,10 +925,7 @@ app.post(
             if (!passwordCorrect) {
 
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Incorrect phone number or password."
                 });
@@ -949,6 +936,10 @@ app.post(
                 user.uid ||
                 userDoc.id;
 
+
+            /* -------------------------------------------------
+               VERIFY FIREBASE USER EXISTS
+            ------------------------------------------------- */
 
             try {
 
@@ -963,17 +954,17 @@ app.post(
                     error
                 );
 
-
                 return res.status(500).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Your authentication account could not be found."
                 });
             }
 
+
+            /* -------------------------------------------------
+               CREATE FIREBASE CUSTOM TOKEN
+            ------------------------------------------------- */
 
             const customToken =
                 await auth.createCustomToken(
@@ -1015,7 +1006,6 @@ app.post(
                 }
             });
 
-
         } catch (error) {
 
             console.error(
@@ -1023,12 +1013,8 @@ app.post(
                 error
             );
 
-
             return res.status(500).json({
-
-                success:
-                    false,
-
+                success: false,
                 message:
                     "Unable to process your login right now."
             });
@@ -1043,6 +1029,7 @@ app.post(
 
 app.post(
     "/api/reset-password",
+
     async (req, res) => {
 
         try {
@@ -1056,10 +1043,7 @@ app.post(
             if (!idToken) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Verification is required."
                 });
@@ -1069,10 +1053,7 @@ app.post(
             if (!newPassword) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "New password is required."
                 });
@@ -1086,10 +1067,7 @@ app.post(
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Password must be at least 6 characters."
                 });
@@ -1113,12 +1091,8 @@ app.post(
                     error
                 );
 
-
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Your verification has expired. Please try again."
                 });
@@ -1152,14 +1126,10 @@ app.post(
 
 
             return res.status(200).json({
-
-                success:
-                    true,
-
+                success: true,
                 message:
                     "Password updated successfully."
             });
-
 
         } catch (error) {
 
@@ -1168,32 +1138,31 @@ app.post(
                 error
             );
 
-
             return res.status(500).json({
-
-                success:
-                    false,
-
+                success: false,
                 message:
                     "We couldn't update your password right now. Please try again."
             });
         }
     }
-); 
+);
+
+
 /* =========================================================
-   PAYSTACK
-   INITIALIZE WALLET FUNDING
+   PAYSTACK INITIALIZATION
+   WALLET FUNDING
 ========================================================= */
 
 app.post(
     "/api/payments/initialize",
+
     async (req, res) => {
 
         try {
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                AUTHENTICATION
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const authHeader =
                 req.headers.authorization ||
@@ -1207,10 +1176,7 @@ app.post(
             ) {
 
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Authentication is required."
                 });
@@ -1218,16 +1184,15 @@ app.post(
 
 
             const idToken =
-                authHeader.substring(7).trim();
+                authHeader
+                    .substring(7)
+                    .trim();
 
 
             if (!idToken) {
 
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Authentication is required."
                 });
@@ -1251,12 +1216,8 @@ app.post(
                     error
                 );
 
-
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Your session has expired. Please log in again."
                 });
@@ -1267,18 +1228,25 @@ app.post(
                 decodedToken.uid;
 
 
-            /* -----------------------------------------
-               INPUT
-            ----------------------------------------- */
+            /* -------------------------------------------------
+               IMPORTANT:
+               FRONTEND MUST SEND amountNaira.
+
+               Example:
+               ₦500 = amountNaira: 500
+
+               The server converts this ONCE to:
+               50000 kobo.
+            ------------------------------------------------- */
 
             const {
-                amount,
+                amountNaira,
                 email
             } = req.body || {};
 
 
             const amountNumber =
-                Number(amount);
+                Number(amountNaira);
 
 
             const normalizedEmail =
@@ -1287,9 +1255,9 @@ app.post(
                     .toLowerCase();
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                VALIDATE AMOUNT
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             if (
                 !Number.isFinite(
@@ -1299,10 +1267,7 @@ app.post(
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Enter a valid amount of at least ₦100."
                 });
@@ -1310,24 +1275,16 @@ app.post(
 
 
             if (
-                amountNumber >
-                10000000
+                amountNumber > 1000000
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "The payment amount is too large."
                 });
             }
 
-
-            /*
-               Only two decimal places are accepted.
-            */
 
             if (
                 Math.round(
@@ -1337,19 +1294,16 @@ app.post(
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Enter a valid amount."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                VALIDATE EMAIL
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const emailPattern =
                 /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -1362,19 +1316,16 @@ app.post(
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Enter a valid email address."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                PAYSTACK SECRET
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const paystackSecret =
                 process.env.PAYSTACK_SECRET_KEY;
@@ -1386,21 +1337,17 @@ app.post(
                     "PAYSTACK_SECRET_KEY is not configured."
                 );
 
-
                 return res.status(500).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Payment service is temporarily unavailable."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                VERIFY NOVAPAY USER
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const userRef =
                 db
@@ -1417,19 +1364,17 @@ app.post(
             if (!userDoc.exists) {
 
                 return res.status(404).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "NovaPay account not found."
                 });
             }
 
 
-            /* -----------------------------------------
-               KOBO
-            ----------------------------------------- */
+            /* -------------------------------------------------
+               NAIRA → KOBO
+               THIS IS THE ONLY CONVERSION.
+            ------------------------------------------------- */
 
             const amountKobo =
                 Math.round(
@@ -1444,19 +1389,16 @@ app.post(
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Invalid payment amount."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                UNIQUE REFERENCE
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const reference =
                 `NP-${uid}-${Date.now()}-${crypto
@@ -1464,9 +1406,9 @@ app.post(
                     .toString("hex")}`;
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                SAVE PENDING PAYMENT
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             await db
                 .collection(
@@ -1507,9 +1449,9 @@ app.post(
                 });
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                INITIALIZE PAYSTACK
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             let paystackResponse;
 
@@ -1534,41 +1476,50 @@ app.post(
                             },
 
                             body:
-    JSON.stringify({
-        email:
-            normalizedEmail,
+                                JSON.stringify({
 
-        amount:
-            String(
-                amountKobo
-            ),
+                                    email:
+                                        normalizedEmail,
 
-        currency:
-            "NGN",
+                                    /* Paystack receives KOBO */
+                                    amount:
+                                        String(
+                                            amountKobo
+                                        ),
 
-        reference:
-            reference,
+                                    currency:
+                                        "NGN",
 
-        callback_url:
-            "https://lordlowkey-ma.github.io/add-money.html",
+                                    reference:
+                                        reference,
 
-        channels: [
-            "card",
-            "bank_transfer"
-        ],
+                                    /*
+                                       Paystack returns the user
+                                       to this page after checkout.
 
-        metadata: {
-            uid:
-                uid,
+                                       The reference will be appended
+                                       by Paystack.
+                                    */
+                                    callback_url:
+    "https://lordlowkey-ma.github.io/NovaPay1/dashboard.html",
 
-            type:
-                "wallet_funding",
+                                    channels: [
+                                        "card",
+                                        "bank_transfer"
+                                    ],
 
-            novaPayReference:
-                reference
-        }
-    })
-                                
+                                    metadata: {
+
+                                        uid:
+                                            uid,
+
+                                        type:
+                                            "wallet_funding",
+
+                                        novaPayReference:
+                                            reference
+                                    }
+                                })
                         }
                     );
 
@@ -1597,15 +1548,16 @@ app.post(
 
 
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "We couldn't connect to the payment service. Please try again."
                 });
             }
 
+
+            /* -------------------------------------------------
+               READ PAYSTACK RESPONSE
+            ------------------------------------------------- */
 
             let paystackData;
 
@@ -1640,19 +1592,16 @@ app.post(
 
 
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "The payment service returned an invalid response."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                PAYSTACK ERROR
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             if (
                 !paystackResponse.ok ||
@@ -1686,10 +1635,7 @@ app.post(
 
 
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "We couldn't start your payment. Please try again."
                 });
@@ -1699,6 +1645,10 @@ app.post(
             const paymentData =
                 paystackData.data;
 
+
+            /* -------------------------------------------------
+               VALIDATE CHECKOUT DATA
+            ------------------------------------------------- */
 
             if (
                 !paymentData.authorization_url ||
@@ -1728,22 +1678,16 @@ app.post(
 
 
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Paystack did not return a valid checkout."
                 });
             }
 
 
-            /*
-               Paystack should return the same
-               reference that NovaPay supplied.
-
-               If it doesn't, do not continue.
-            */
+            /* -------------------------------------------------
+               REFERENCE MUST MATCH
+            ------------------------------------------------- */
 
             if (
                 paymentData.reference !==
@@ -1774,19 +1718,16 @@ app.post(
 
 
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Payment reference verification failed."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                SAVE PAYSTACK DETAILS
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             await db
                 .collection(
@@ -1814,9 +1755,9 @@ app.post(
                 });
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                RETURN CHECKOUT URL
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             return res.status(200).json({
 
@@ -1840,10 +1781,7 @@ app.post(
 
 
             return res.status(500).json({
-
-                success:
-                    false,
-
+                success: false,
                 message:
                     "We couldn't start your payment right now."
             });
@@ -1859,13 +1797,14 @@ app.post(
 
 app.get(
     "/api/payments/verify/:reference",
+
     async (req, res) => {
 
         try {
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                AUTHENTICATION
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const authHeader =
                 req.headers.authorization ||
@@ -1879,10 +1818,7 @@ app.get(
             ) {
 
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Authentication is required."
                 });
@@ -1890,7 +1826,19 @@ app.get(
 
 
             const idToken =
-                authHeader.substring(7).trim();
+                authHeader
+                    .substring(7)
+                    .trim();
+
+
+            if (!idToken) {
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Authentication is required."
+                });
+            }
 
 
             let decodedToken;
@@ -1905,11 +1853,13 @@ app.get(
 
             } catch (error) {
 
+                console.error(
+                    "Payment verification token failed:",
+                    error
+                );
+
                 return res.status(401).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Your session has expired. Please log in again."
                 });
@@ -1920,9 +1870,9 @@ app.get(
                 decodedToken.uid;
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                REFERENCE
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const reference =
                 String(
@@ -1937,19 +1887,16 @@ app.get(
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Invalid payment reference."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                FIND NOVAPAY PAYMENT
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const paymentRef =
                 db
@@ -1966,10 +1913,7 @@ app.get(
             if (!paymentDoc.exists) {
 
                 return res.status(404).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Payment record not found."
                 });
@@ -1980,9 +1924,9 @@ app.get(
                 paymentDoc.data();
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                USER OWNERSHIP CHECK
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             if (
                 savedPayment.uid !==
@@ -1990,19 +1934,16 @@ app.get(
             ) {
 
                 return res.status(403).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "You are not authorized to verify this payment."
                 });
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                ALREADY CREDITED
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             if (
                 savedPayment.status ===
@@ -2026,9 +1967,9 @@ app.get(
             }
 
 
-            /* -----------------------------------------
+            /* -------------------------------------------------
                PAYSTACK SECRET
-            ----------------------------------------- */
+            ------------------------------------------------- */
 
             const paystackSecret =
                 process.env.PAYSTACK_SECRET_KEY;
@@ -2040,21 +1981,17 @@ app.get(
                     "PAYSTACK_SECRET_KEY is not configured."
                 );
 
-
                 return res.status(500).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Payment service is temporarily unavailable."
                 });
             }
 
 
-            /* -----------------------------------------
-               ASK PAYSTACK
-            ----------------------------------------- */
+            /* -------------------------------------------------
+               VERIFY WITH PAYSTACK
+            ------------------------------------------------- */
 
             let verifyResponse;
 
@@ -2089,17 +2026,17 @@ app.get(
                     error
                 );
 
-
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "We couldn't verify the payment right now."
                 });
             }
 
+
+            /* -------------------------------------------------
+               READ VERIFICATION RESPONSE
+            ------------------------------------------------- */
 
             let verifyData;
 
@@ -2112,10 +2049,7 @@ app.get(
             } catch (error) {
 
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "The payment service returned an invalid verification response."
                 });
@@ -2133,12 +2067,8 @@ app.get(
                     verifyData
                 );
 
-
                 return res.status(502).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Paystack could not verify this payment."
                 });
@@ -2149,9 +2079,9 @@ app.get(
                 verifyData.data;
 
 
-            /* -----------------------------------------
-               CONFIRM REFERENCE
-            ----------------------------------------- */
+            /* -------------------------------------------------
+               REFERENCE MUST MATCH
+            ------------------------------------------------- */
 
             if (
                 payment.reference !==
@@ -2159,19 +2089,16 @@ app.get(
             ) {
 
                 return res.status(400).json({
-
-                    success:
-                        false,
-
+                    success: false,
                     message:
                         "Payment reference verification failed."
                 });
             }
 
 
-            /* -----------------------------------------
-               CREDIT IF SUCCESSFUL
-            ----------------------------------------- */
+            /* -------------------------------------------------
+               CREDIT USING THE SAME SAFE FUNCTION
+            ------------------------------------------------- */
 
             const result =
                 await creditPaystackPayment(
@@ -2254,10 +2181,7 @@ app.get(
 
 
             return res.status(500).json({
-
-                success:
-                    false,
-
+                success: false,
                 message:
                     "We couldn't verify your payment right now."
             });
