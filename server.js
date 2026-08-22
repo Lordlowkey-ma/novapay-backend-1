@@ -22,6 +22,9 @@ const {
 
 const app = express();
 
+const auth = getAuth();
+const db = getFirestore();
+
 
 /* =========================================================
    SECURITY
@@ -37,12 +40,14 @@ app.use(cors({
 
 /* =========================================================
    PAYSTACK WEBHOOK
-   MUST BE BEFORE express.json()
+   MUST COME BEFORE express.json()
 ========================================================= */
 
 app.post(
     "/api/payments/webhook",
-    express.raw({ type: "application/json" }),
+    express.raw({
+        type: "application/json"
+    }),
     async (req, res) => {
 
         try {
@@ -53,13 +58,16 @@ app.post(
             const secret =
                 process.env.PAYSTACK_SECRET_KEY;
 
+
             if (!secret) {
+
                 console.error(
                     "PAYSTACK_SECRET_KEY is missing."
                 );
 
                 return res.sendStatus(500);
             }
+
 
             if (!signature) {
                 return res.sendStatus(401);
@@ -72,13 +80,17 @@ app.post(
 
             const expectedSignature =
                 crypto
-                    .createHmac("sha512", secret)
+                    .createHmac(
+                        "sha512",
+                        secret
+                    )
                     .update(req.body)
                     .digest("hex");
 
 
             const signaturesMatch =
-                signature.length === expectedSignature.length &&
+                signature.length ===
+                    expectedSignature.length &&
                 crypto.timingSafeEqual(
                     Buffer.from(signature),
                     Buffer.from(expectedSignature)
@@ -105,22 +117,17 @@ app.post(
                 );
 
 
-            /*
-               Only successful charges can
-               credit a NovaPay wallet.
-            */
-
             if (
                 event.event !==
                 "charge.success"
             ) {
+
                 return res.sendStatus(200);
             }
 
 
             const payment =
                 event.data;
-
 
             const reference =
                 payment?.reference;
@@ -132,7 +139,7 @@ app.post(
 
 
             /* -----------------------------------------
-               FIND NOVAPAY PAYMENT
+               FIND PAYMENT
             ----------------------------------------- */
 
             const paymentRef =
@@ -140,12 +147,6 @@ app.post(
                     .collection("novapayPayments")
                     .doc(reference);
 
-
-            /*
-               Firestore transaction prevents the
-               same Paystack webhook from crediting
-               the wallet twice.
-            */
 
             await db.runTransaction(
                 async (transaction) => {
@@ -172,7 +173,7 @@ app.post(
 
 
                     /* ---------------------------------
-                       ALREADY CREDITED
+                       PREVENT DOUBLE CREDIT
                     --------------------------------- */
 
                     if (
@@ -184,7 +185,7 @@ app.post(
 
 
                     /* ---------------------------------
-                       BASIC VALIDATION
+                       VALIDATE PAYMENT
                     --------------------------------- */
 
                     if (
@@ -324,6 +325,7 @@ app.post(
                     transaction.set(
                         transactionRef,
                         {
+
                             uid:
                                 uid,
 
@@ -363,6 +365,7 @@ app.post(
                     transaction.update(
                         paymentRef,
                         {
+
                             status:
                                 "credited",
 
@@ -377,6 +380,7 @@ app.post(
                                     .serverTimestamp()
                         }
                     );
+
                 }
             );
 
@@ -394,7 +398,13 @@ app.post(
             return res.sendStatus(500);
         }
     }
-); 
+);
+
+
+/* =========================================================
+   JSON BODY PARSER
+========================================================= */
+
 app.use(express.json({
     limit: "10kb"
 }));
@@ -415,14 +425,6 @@ app.use(apiLimiter);
 
 
 /* =========================================================
-   FIREBASE SERVICES
-========================================================= */
-
-const auth = getAuth();
-const db = getFirestore();
-
-
-/* =========================================================
    HEALTH CHECK
 ========================================================= */
 
@@ -430,7 +432,8 @@ app.get("/", (req, res) => {
 
     res.json({
         success: true,
-        message: "NovaPay backend is running."
+        message:
+            "NovaPay backend is running."
     });
 
 });
@@ -440,224 +443,309 @@ app.get("/", (req, res) => {
    REGISTER
 ========================================================= */
 
-app.post("/api/register", async (req, res) => {
+app.post(
+    "/api/register",
+    async (req, res) => {
 
-    try {
+        try {
 
-        const {
-            idToken,
-            username,
-            password
-        } = req.body || {};
-
-
-        if (!idToken) {
-
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Phone verification is required."
-            });
-
-        }
-
-
-        if (!username) {
-
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Username is required."
-            });
-
-        }
-
-
-        if (!password) {
-
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Password is required."
-            });
-
-        }
-
-
-        const result =
-            await registerUser({
+            const {
                 idToken,
                 username,
                 password
-            });
+            } = req.body || {};
 
 
-        return res.status(201).json({
-            success: true,
-            message:
-                "Account created successfully.",
-            uid:
-                result.uid
-        });
+            if (!idToken) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Phone verification is required."
+                });
+            }
 
 
-    } catch (error) {
+            if (!username) {
 
-        console.error(
-            "Register error:",
-            error
-        );
-
-
-        return res.status(400).json({
-            success: false,
-            message:
-                error.message ||
-                "Unable to create account."
-        });
-
-    }
-
-}); 
-/* =========================================================
-   LOGIN
-========================================================= */
-
-app.post("/api/login", async (req, res) => {
-
-    try {
-
-        const {
-            username,
-            password
-        } = req.body || {};
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Username is required."
+                });
+            }
 
 
-        /* -----------------------------------------
-           VALIDATION
-        ----------------------------------------- */
+            if (!password) {
 
-        if (!username) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Password is required."
+                });
+            }
 
-            return res.status(400).json({
-                success: false,
+
+            const result =
+                await registerUser({
+                    idToken,
+                    username,
+                    password
+                });
+
+
+            return res.status(201).json({
+
+                success: true,
+
                 message:
-                    "Username is required."
+                    "Account created successfully.",
+
+                uid:
+                    result.uid
             });
 
-        }
 
+        } catch (error) {
 
-        if (!password) {
-
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Password is required."
-            });
-
-        }
-
-
-        /* -----------------------------------------
-           FIND USER
-        ----------------------------------------- */
-
-        const snapshot =
-            await db
-                .collection("novapayUsers")
-                .where(
-                    "username",
-                    "==",
-                    username.trim()
-                )
-                .limit(1)
-                .get();
-
-
-        if (snapshot.empty) {
-
-            return res.status(401).json({
-                success: false,
-                message:
-                    "Invalid username or password."
-            });
-
-        }
-
-
-        const userDoc =
-            snapshot.docs[0];
-
-
-        const user =
-            userDoc.data();
-
-
-        /* -----------------------------------------
-           VERIFY PASSWORD
-        ----------------------------------------- */
-
-        const passwordValid =
-            await verifyPasswordHash(
-                password,
-                user.passwordHash
+            console.error(
+                "Register error:",
+                error
             );
 
 
-        if (!passwordValid) {
+            return res.status(400).json({
 
-            return res.status(401).json({
                 success: false,
+
                 message:
-                    "Invalid username or password."
+                    error.message ||
+                    "Unable to create account."
+            });
+        }
+    }
+);
+
+
+/* =========================================================
+   LOGIN
+   PHONE NUMBER + PASSWORD
+========================================================= */
+
+app.post(
+    "/api/login",
+    async (req, res) => {
+
+        try {
+
+            const {
+                phone,
+                password
+            } = req.body || {};
+
+
+            if (!phone) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Phone number is required."
+                });
+            }
+
+
+            if (!password) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Password is required."
+                });
+            }
+
+
+            /* -----------------------------------------
+               NORMALIZE PHONE
+            ----------------------------------------- */
+
+            let normalizedPhone =
+                String(phone)
+                    .trim()
+                    .replace(/\s+/g, "")
+                    .replace(/-/g, "")
+                    .replace(/[()]/g, "");
+
+
+            if (
+                normalizedPhone.startsWith("0") &&
+                normalizedPhone.length === 11
+            ) {
+
+                normalizedPhone =
+                    "+234" +
+                    normalizedPhone.substring(1);
+            }
+
+
+            if (
+                normalizedPhone.startsWith("234") &&
+                !normalizedPhone.startsWith("+234")
+            ) {
+
+                normalizedPhone =
+                    "+" +
+                    normalizedPhone;
+            }
+
+
+            /* -----------------------------------------
+               FIND USER BY PHONE
+            ----------------------------------------- */
+
+            const userQuery =
+                await db
+                    .collection("novapayUsers")
+                    .where(
+                        "phoneNumber",
+                        "==",
+                        normalizedPhone
+                    )
+                    .limit(1)
+                    .get();
+
+
+            if (userQuery.empty) {
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Incorrect phone number or password."
+                });
+            }
+
+
+            const userDoc =
+                userQuery.docs[0];
+
+            const user =
+                userDoc.data();
+
+
+            if (
+                !user.passwordHash ||
+                !user.passwordSalt
+            ) {
+
+                console.error(
+                    "NovaPay login: password data missing:",
+                    userDoc.id
+                );
+
+
+                return res.status(500).json({
+                    success: false,
+                    message:
+                        "This account cannot be logged in at the moment."
+                });
+            }
+
+
+            const passwordCorrect =
+                await verifyPasswordHash(
+                    password,
+                    user.passwordSalt,
+                    user.passwordHash
+                );
+
+
+            if (!passwordCorrect) {
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Incorrect phone number or password."
+                });
+            }
+
+
+            const uid =
+                user.uid || userDoc.id;
+
+
+            try {
+
+                await auth.getUser(uid);
+
+            } catch (error) {
+
+                console.error(
+                    "NovaPay login: Firebase user not found:",
+                    error
+                );
+
+
+                return res.status(500).json({
+                    success: false,
+                    message:
+                        "Your authentication account could not be found."
+                });
+            }
+
+
+            const customToken =
+                await auth.createCustomToken(
+                    uid,
+                    {
+                        novaPayUser: true
+                    }
+                );
+
+
+            return res.status(200).json({
+
+                success: true,
+
+                message:
+                    "Login successful.",
+
+                token:
+                    customToken,
+
+                user: {
+
+                    uid:
+                        uid,
+
+                    username:
+                        user.username || "",
+
+                    phoneNumber:
+                        user.phoneNumber || "",
+
+                    phoneVerified:
+                        user.phoneVerified === true
+                }
             });
 
+
+        } catch (error) {
+
+            console.error(
+                "NovaPay login error:",
+                error
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to process your login right now."
+            });
         }
-
-
-        /* -----------------------------------------
-           RETURN USER
-        ----------------------------------------- */
-
-        return res.status(200).json({
-
-            success: true,
-
-            message:
-                "Login successful.",
-
-            user: {
-
-                uid:
-                    userDoc.id,
-
-                username:
-                    user.username,
-
-                phoneNumber:
-                    user.phoneNumber || null
-            }
-        });
-
-
-    } catch (error) {
-
-        console.error(
-            "Login error:",
-            error
-        );
-
-
-        return res.status(500).json({
-            success: false,
-            message:
-                "Unable to complete login right now."
-        });
-
     }
-
-}); 
+);
 /* =========================================================
    RESET PASSWORD
 ========================================================= */
@@ -685,7 +773,6 @@ app.post(
                     message:
                         "Verification is required."
                 });
-
             }
 
 
@@ -696,7 +783,6 @@ app.post(
                     message:
                         "New password is required."
                 });
-
             }
 
 
@@ -710,7 +796,6 @@ app.post(
                     message:
                         "Password must be at least 6 characters."
                 });
-
             }
 
 
@@ -734,12 +819,12 @@ app.post(
                     error
                 );
 
+
                 return res.status(401).json({
                     success: false,
                     message:
                         "Your verification has expired. Please try again."
                 });
-
             }
 
 
@@ -778,10 +863,6 @@ app.post(
                 });
 
 
-            /* -----------------------------------------
-               SUCCESS
-            ----------------------------------------- */
-
             return res.status(200).json({
 
                 success: true,
@@ -800,17 +881,20 @@ app.post(
 
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "We couldn't update your password right now. Please try again."
             });
-
         }
-
     }
-); 
+);
+
+
 /* =========================================================
-   PAYSTACK — INITIALIZE WALLET FUNDING
+   PAYSTACK
+   INITIALIZE WALLET FUNDING
 ========================================================= */
 
 app.post(
@@ -832,11 +916,12 @@ app.post(
             ) {
 
                 return res.status(401).json({
+
                     success: false,
+
                     message:
                         "Authentication is required."
                 });
-
             }
 
 
@@ -860,12 +945,14 @@ app.post(
                     error
                 );
 
+
                 return res.status(401).json({
+
                     success: false,
+
                     message:
                         "Your session has expired. Please log in again."
                 });
-
             }
 
 
@@ -903,11 +990,12 @@ app.post(
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Enter a valid amount of at least ₦100."
                 });
-
             }
 
 
@@ -916,11 +1004,12 @@ app.post(
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "The payment amount is too large."
                 });
-
             }
 
 
@@ -939,11 +1028,12 @@ app.post(
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Enter a valid email address."
                 });
-
             }
 
 
@@ -961,12 +1051,14 @@ app.post(
                     "PAYSTACK_SECRET_KEY is not configured."
                 );
 
+
                 return res.status(500).json({
+
                     success: false,
+
                     message:
                         "Payment service is temporarily unavailable."
                 });
-
             }
 
 
@@ -987,16 +1079,17 @@ app.post(
             if (!userDoc.exists) {
 
                 return res.status(404).json({
+
                     success: false,
+
                     message:
                         "NovaPay account not found."
                 });
-
             }
 
 
             /* -----------------------------------------
-               AMOUNT → KOBO
+               CONVERT TO KOBO
             ----------------------------------------- */
 
             const amountKobo =
@@ -1006,7 +1099,7 @@ app.post(
 
 
             /* -----------------------------------------
-               UNIQUE PAYMENT REFERENCE
+               UNIQUE REFERENCE
             ----------------------------------------- */
 
             const reference =
@@ -1056,7 +1149,6 @@ app.post(
                         )
                             .FieldValue
                             .serverTimestamp()
-
                 });
 
 
@@ -1068,7 +1160,9 @@ app.post(
                 await fetch(
                     "https://api.paystack.co/transaction/initialize",
                     {
-                        method: "POST",
+
+                        method:
+                            "POST",
 
                         headers: {
 
@@ -1077,45 +1171,42 @@ app.post(
 
                             "Content-Type":
                                 "application/json"
-
                         },
 
-                        body: JSON.stringify({
+                        body:
+                            JSON.stringify({
 
-                            email:
-                                normalizedEmail,
+                                email:
+                                    normalizedEmail,
 
-                            amount:
-                                String(
-                                    amountKobo
-                                ),
+                                amount:
+                                    String(
+                                        amountKobo
+                                    ),
 
-                            currency:
-                                "NGN",
+                                currency:
+                                    "NGN",
 
-                            reference:
-                                reference,
+                                reference:
+                                    reference,
 
-                            channels: [
-                                "card",
-                                "bank_transfer"
-                            ],
+                                channels: [
+                                    "card",
+                                    "bank_transfer"
+                                ],
 
-                            metadata: {
+                                metadata: {
 
-                                uid:
-                                    uid,
+                                    uid:
+                                        uid,
 
-                                type:
-                                    "wallet_funding",
+                                    type:
+                                        "wallet_funding",
 
-                                novaPayReference:
-                                    reference
-
-                            }
-
-                        })
-
+                                    novaPayReference:
+                                        reference
+                                }
+                            })
                     }
                 );
 
@@ -1153,16 +1244,16 @@ app.post(
                             )
                                 .FieldValue
                                 .serverTimestamp()
-
                     });
 
 
                 return res.status(502).json({
+
                     success: false,
+
                     message:
                         "We couldn't start your payment. Please try again."
                 });
-
             }
 
 
@@ -1197,7 +1288,6 @@ app.post(
                         )
                             .FieldValue
                             .serverTimestamp()
-
                 });
 
 
@@ -1215,7 +1305,6 @@ app.post(
 
                 reference:
                     paymentData.reference
-
             });
 
 
@@ -1228,21 +1317,31 @@ app.post(
 
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "We couldn't start your payment right now."
             });
-
         }
+    }
+); 
+/* =========================================================
+   SERVER START
+========================================================= */
+
+const PORT =
+    process.env.PORT || 3000;
+
+
+app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+
+        console.log(
+            `NovaPay backend running on port ${PORT}`
+        );
 
     }
 );
-/* =========================================================
-   START NOVAPAY SERVER
-========================================================= */
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`NovaPay backend running on port ${PORT}`);
-});
