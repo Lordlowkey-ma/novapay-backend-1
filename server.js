@@ -1534,39 +1534,41 @@ app.post(
                             },
 
                             body:
-                                JSON.stringify({
+    JSON.stringify({
+        email:
+            normalizedEmail,
 
-                                    email:
-                                        normalizedEmail,
+        amount:
+            String(
+                amountKobo
+            ),
 
-                                    amount:
-                                        String(
-                                            amountKobo
-                                        ),
+        currency:
+            "NGN",
 
-                                    currency:
-                                        "NGN",
+        reference:
+            reference,
 
-                                    reference:
-                                        reference,
+        callback_url:
+            "https://lordlowkey-ma.github.io/add-money.html",
 
-                                    channels: [
-                                        "card",
-                                        "bank_transfer"
-                                    ],
+        channels: [
+            "card",
+            "bank_transfer"
+        ],
 
-                                    metadata: {
+        metadata: {
+            uid:
+                uid,
 
-                                        uid:
-                                            uid,
+            type:
+                "wallet_funding",
 
-                                        type:
-                                            "wallet_funding",
-
-                                        novaPayReference:
-                                            reference
-                                    }
-                                })
+            novaPayReference:
+                reference
+        }
+    })
+                                
                         }
                     );
 
