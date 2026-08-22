@@ -408,30 +408,31 @@ async function registerUser({
 
     await userRef.set({
 
-        uid: uid,
+    uid: uid,
 
-        username: username,
+    username: username,
 
-        usernameLower:
-            username.toLowerCase(),
+    usernameLower:
+        username.toLowerCase(),
 
-        phoneNumber: phoneNumber,
+    phoneNumber: phoneNumber,
 
-        passwordHash:
-            passwordData.hash,
+    passwordHash:
+        passwordData.hash,
 
-        passwordSalt:
-            passwordData.salt,
+    passwordSalt:
+        passwordData.salt,
 
-        phoneVerified: true,
+    phoneVerified: true,
 
-        createdAt:
-            FieldValue.serverTimestamp(),
+    walletBalance: 0,
 
-        updatedAt:
-            FieldValue.serverTimestamp()
+    createdAt:
+        FieldValue.serverTimestamp(),
 
-    });
+    updatedAt:
+        FieldValue.serverTimestamp()
+});
 
 
     /* -------------------------------------------------------
