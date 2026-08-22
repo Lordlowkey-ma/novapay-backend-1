@@ -4,22 +4,16 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 
-const {
-    registerUser,
-    verifyPasswordHash,
-    hashPassword
-} = require("./register-backend");
-
 require("./firebase");
 
-const {
-    getAuth
-} = require("firebase-admin/auth");
+const { getAuth } =
+    require("firebase-admin/auth");
 
 const {
     getFirestore,
     FieldValue
-} = require("firebase-admin/firestore");
+} =
+    require("firebase-admin/firestore");
 
 
 const app = express();
@@ -27,335 +21,874 @@ const app = express();
 const auth = getAuth();
 const db = getFirestore();
 
+const PORT =
+    Number(
+        process.env.PORT || 3000
+    );
+
+
+/* =========================================================
+   PAYSTACK WEBHOOK
+   ---------------------------------------------------------
+   IMPORTANT:
+   The webhook must receive the raw request body before
+   express.json() processes normal JSON requests.
+========================================================= */
+
+app.post(
+    "/api/payments/webhook",
+    express.raw({
+        type: "application/json"
+    }),
+    async (req, res) => {
+
+        try {
+
+            if (
+                !PAYSTACK_SECRET_KEY
+            ) {
+
+                return res
+                    .status(500)
+                    .send(
+                        "Webhook unavailable."
+                    );
+            }
+
+
+            const rawBody =
+                Buffer.isBuffer(
+                    req.body
+                )
+                    ? req.body
+                    : Buffer.from("");
+
+
+            const signature =
+                String(
+                    req.headers[
+                        "x-paystack-signature"
+                    ] || ""
+                ).trim();
+
+
+            if (!signature) {
+
+                return res
+                    .status(401)
+                    .send(
+                        "Invalid signature."
+                    );
+            }
+
+
+            const expectedSignature =
+                crypto
+                    .createHmac(
+                        "sha512",
+                        PAYSTACK_SECRET_KEY
+                    )
+                    .update(rawBody)
+                    .digest("hex");
+
+
+            const received =
+                Buffer.from(
+                    signature,
+                    "utf8"
+                );
+
+
+            const expected =
+                Buffer.from(
+                    expectedSignature,
+                    "utf8"
+                );
+
+
+            if (
+                received.length !==
+                    expected.length ||
+                !crypto.timingSafeEqual(
+                    received,
+                    expected
+                )
+            ) {
+
+                return res
+                    .status(401)
+                    .send(
+                        "Invalid signature."
+                    );
+            }
+
+
+            const event =
+                JSON.parse(
+                    rawBody.toString(
+                        "utf8"
+                    )
+                );
+
+
+            if (
+                event.event !==
+                "charge.success"
+            ) {
+
+                return res
+                    .status(200)
+                    .send(
+                        "Event received."
+                    );
+            }
+
+
+            const transaction =
+                event.data || {};
+
+
+            const reference =
+                String(
+                    transaction.reference ||
+                    ""
+                ).trim();
+
+
+            if (
+                !reference ||
+                transaction.status !==
+                    "success" ||
+                String(
+                    transaction.currency ||
+                    ""
+                ).toUpperCase() !==
+                    "NGN"
+            ) {
+
+                return res
+                    .status(200)
+                    .send(
+                        "Event received."
+                    );
+            }
+
+
+            const paymentSnapshot =
+                await db
+                    .collection(
+                        "novapayPayments"
+                    )
+                    .doc(reference)
+                    .get();
+
+
+            if (
+                !paymentSnapshot.exists
+            ) {
+
+                return res
+                    .status(200)
+                    .send(
+                        "Event received."
+                    );
+            }
+
+
+            const savedPayment =
+                paymentSnapshot.data() ||
+                {};
+
+
+            if (
+                !savedPayment.uid
+            ) {
+
+                return res
+                    .status(200)
+                    .send(
+                        "Event received."
+                    );
+            }
+
+
+            const result =
+                await creditPayment(
+                    reference,
+                    transaction
+                );
+
+
+            console.log(
+                "Paystack webhook processed:",
+                {
+                    reference,
+                    result
+                }
+            );
+
+
+            return res
+                .status(200)
+                .send(
+                    "Event processed."
+                );
+
+        } catch (error) {
+
+            console.error(
+                "Paystack webhook error:",
+                error
+            );
+
+
+            return res
+                .status(500)
+                .send(
+                    "Webhook processing failed."
+                );
+        }
+    }
+);
+
+
+/* =========================================================
+   BODY PARSING
+========================================================= */
+
+app.use(
+    express.json({
+        limit: "1mb"
+    })
+);
+
+
+app.use(
+    express.urlencoded({
+        extended: true,
+        limit: "1mb"
+    })
+);
+
+
+const FRONTEND_URL =
+    "https://lordlowkey-ma.github.io/NovaPay1";
+
+
+const PAYSTACK_SECRET_KEY =
+    process.env.PAYSTACK_SECRET_KEY;
+
 
 /* =========================================================
    SECURITY
 ========================================================= */
 
-app.use(helmet());
+app.use(
+    helmet()
+);
 
-app.use(cors({
-    origin: true,
-    credentials: true
-}));
+
+app.use(
+    cors({
+        origin: [
+            FRONTEND_URL
+        ],
+        credentials: true
+    })
+);
 
 
 /* =========================================================
-   PAYSTACK WALLET CREDIT
-   ---------------------------------------------------------
-   This is the ONLY function allowed to credit a wallet
-   from a Paystack payment.
-
-   Both:
-   - Paystack webhook
-   - Server-side verification
-
-   use this same function.
-
-   This prevents duplicate wallet credits.
+   RATE LIMIT
 ========================================================= */
 
-async function creditPaystackPayment(
-    payment,
-    expectedReference = null
-) {
+const apiLimiter =
+    rateLimit({
+        windowMs:
+            15 * 60 * 1000,
 
-    if (!payment) {
-        return {
-            credited: false,
-            alreadyCredited: false,
-            reason: "missing_payment"
-        };
-    }
+        max:
+            300,
 
+        standardHeaders:
+            true,
 
-    const reference =
-        String(payment.reference || "").trim();
+        legacyHeaders:
+            false
+    });
 
 
-    if (!reference) {
-        return {
-            credited: false,
-            alreadyCredited: false,
-            reason: "missing_reference"
-        };
-    }
+app.use(
+    "/api",
+    apiLimiter
+);
 
 
-    /* ---------------------------------------------------------
-       REFERENCE CHECK
-    --------------------------------------------------------- */
+/* =========================================================
+   FIREBASE AUTHENTICATION
+========================================================= */
 
-    if (
-        expectedReference &&
-        reference !== expectedReference
-    ) {
+async function requireUser(req) {
 
-        console.error(
-            "Paystack reference mismatch:",
-            reference,
-            expectedReference
+    const authorization =
+        String(
+            req.headers.authorization ||
+            ""
         );
 
+
+    if (
+        !authorization.startsWith(
+            "Bearer "
+        )
+    ) {
+
+        const error =
+            new Error(
+                "Authentication required."
+            );
+
+        error.statusCode =
+            401;
+
+        throw error;
+    }
+
+
+    const token =
+        authorization
+            .slice(7)
+            .trim();
+
+
+    if (!token) {
+
+        const error =
+            new Error(
+                "Authentication required."
+            );
+
+        error.statusCode =
+            401;
+
+        throw error;
+    }
+
+
+    try {
+
+        const decoded =
+            await auth.verifyIdToken(
+                token
+            );
+
+
+        return decoded;
+
+    } catch (error) {
+
+        console.error(
+            "Firebase authentication failed:",
+            error.message
+        );
+
+
+        const authError =
+            new Error(
+                "Your session has expired. Please log in again."
+            );
+
+
+        authError.statusCode =
+            401;
+
+
+        throw authError;
+    }
+}
+
+
+/* =========================================================
+   FIRESTORE USER HELPERS
+========================================================= */
+
+async function getUserDocument(
+    uid
+) {
+
+    const userRef =
+        db
+            .collection("users")
+            .doc(uid);
+
+
+    const snapshot =
+        await userRef.get();
+
+
+    if (
+        !snapshot.exists
+    ) {
+
         return {
-            credited: false,
-            alreadyCredited: false,
-            reason: "reference_mismatch"
+            ref: userRef,
+            exists: false,
+            data: {}
+        };
+    }
+
+
+    return {
+        ref: userRef,
+        exists: true,
+        data:
+            snapshot.data() || {}
+    };
+}
+
+
+/* =========================================================
+   NUMBER HELPERS
+========================================================= */
+
+function toFiniteNumber(
+    value,
+    fallback = 0
+) {
+
+    const number =
+        Number(value);
+
+
+    return Number.isFinite(
+        number
+    )
+        ? number
+        : fallback;
+}
+
+
+function toNairaFromKobo(
+    amountKobo
+) {
+
+    return (
+        toFiniteNumber(
+            amountKobo,
+            0
+        ) / 100
+    );
+}
+
+
+function toKoboFromNaira(
+    amountNaira
+) {
+
+    return Math.round(
+        toFiniteNumber(
+            amountNaira,
+            0
+        ) * 100
+    );
+}
+
+
+/* =========================================================
+   PAYMENT CONSTANTS
+========================================================= */
+
+const MIN_DEPOSIT_NAIRA =
+    50;
+
+
+const MAX_DEPOSIT_NAIRA =
+    1000000;
+
+
+/* =========================================================
+   PAYMENT VALIDATION
+========================================================= */
+
+function validateDepositAmount(
+    amountNaira
+) {
+
+    const amount =
+        Number(
+            amountNaira
+        );
+
+
+    if (
+        !Number.isFinite(
+            amount
+        )
+    ) {
+
+        return {
+            valid: false,
+            message:
+                "Invalid payment amount."
+        };
+    }
+
+
+    if (
+        amount <
+        MIN_DEPOSIT_NAIRA
+    ) {
+
+        return {
+            valid: false,
+            message:
+                "Minimum amount is ₦50."
+        };
+    }
+
+
+    if (
+        amount >
+        MAX_DEPOSIT_NAIRA
+    ) {
+
+        return {
+            valid: false,
+            message:
+                "Maximum amount is ₦1,000,000."
+        };
+    }
+
+
+    if (
+        Math.round(
+            amount * 100
+        ) !==
+        amount * 100
+    ) {
+
+        return {
+            valid: false,
+            message:
+                "Amount can have no more than two decimal places."
+        };
+    }
+
+
+    return {
+        valid: true,
+        amount:
+            Number(
+                amount.toFixed(2)
+            )
+    };
+} 
+/* =========================================================
+   GET USER WALLET
+========================================================= */
+
+async function getWalletBalance(
+    uid
+) {
+
+    const user =
+        await getUserDocument(
+            uid
+        );
+
+
+    const balance =
+        toFiniteNumber(
+            user.data.walletBalance ??
+            user.data.balance ??
+            0,
+            0
+        );
+
+
+    return balance;
+}
+
+
+/* =========================================================
+   CREATE PAYMENT REFERENCE
+========================================================= */
+
+function createPaymentReference() {
+
+    return (
+        "NP_" +
+        Date.now() +
+        "_" +
+        crypto
+            .randomBytes(8)
+            .toString("hex")
+    );
+}
+
+
+/* =========================================================
+   CREDIT VERIFIED PAYMENT
+   ---------------------------------------------------------
+   This function is the ONLY place where a successful
+   payment is allowed to increase the user's wallet.
+========================================================= */
+
+async function creditPayment(
+    reference,
+    transaction
+) {
+
+    if (!reference) {
+
+        return {
+            success: false,
+            reason:
+                "Missing payment reference."
+        };
+    }
+
+
+    const transactionReference =
+        String(
+            transaction?.reference ||
+            ""
+        ).trim();
+
+
+    if (
+        transactionReference !==
+        reference
+    ) {
+
+        return {
+            success: false,
+            reason:
+                "Payment reference mismatch."
+        };
+    }
+
+
+    if (
+        transaction?.status !==
+        "success"
+    ) {
+
+        return {
+            success: false,
+            reason:
+                "Payment was not successful."
+        };
+    }
+
+
+    const currency =
+        String(
+            transaction?.currency ||
+            ""
+        ).toUpperCase();
+
+
+    if (
+        currency !==
+        "NGN"
+    ) {
+
+        return {
+            success: false,
+            reason:
+                "Invalid payment currency."
         };
     }
 
 
     const paymentRef =
         db
-            .collection("novapayPayments")
+            .collection(
+                "novapayPayments"
+            )
             .doc(reference);
 
 
-    let result = {
-        credited: false,
-        alreadyCredited: false,
-        reason: "not_processed"
-    };
+    return db.runTransaction(
+        async (firestoreTransaction) => {
 
-
-    await db.runTransaction(
-        async (transaction) => {
-
-            const paymentDoc =
-                await transaction.get(
+            const paymentSnapshot =
+                await firestoreTransaction.get(
                     paymentRef
                 );
 
 
-            /* -------------------------------------------------
-               PAYMENT MUST EXIST
-            ------------------------------------------------- */
-
-            if (!paymentDoc.exists) {
-
-                console.warn(
-                    "Unknown Paystack payment:",
-                    reference
-                );
-
-                result = {
-                    credited: false,
-                    alreadyCredited: false,
-                    reason: "payment_not_found"
-                };
-
-                return;
-            }
-
-
-            const savedPayment =
-                paymentDoc.data();
-
-
-            /* -------------------------------------------------
-               PREVENT DOUBLE CREDIT
-            ------------------------------------------------- */
-
             if (
-                savedPayment.status ===
-                "credited"
+                !paymentSnapshot.exists
             ) {
 
-                result = {
-                    credited: false,
-                    alreadyCredited: true,
-                    reason: "already_credited"
+                return {
+                    success: false,
+                    reason:
+                        "Payment record not found."
                 };
-
-                return;
             }
 
 
-            /* -------------------------------------------------
-               PAYMENT MUST BE SUCCESSFUL
-            ------------------------------------------------- */
+            const payment =
+                paymentSnapshot.data() ||
+                {};
 
-            if (
-                payment.status !==
-                "success"
-            ) {
-
-                result = {
-                    credited: false,
-                    alreadyCredited: false,
-                    reason: "payment_not_successful"
-                };
-
-                return;
-            }
-
-
-            /* -------------------------------------------------
-               CURRENCY CHECK
-            ------------------------------------------------- */
-
-            if (
-                String(
-                    payment.currency || ""
-                ).toUpperCase() !== "NGN"
-            ) {
-
-                console.error(
-                    "Unexpected Paystack currency:",
-                    payment.currency
-                );
-
-                result = {
-                    credited: false,
-                    alreadyCredited: false,
-                    reason: "invalid_currency"
-                };
-
-                return;
-            }
-
-
-            /* -------------------------------------------------
-               PAYSTACK AMOUNT
-               Paystack amount is in kobo.
-            ------------------------------------------------- */
-
-            const paystackAmount =
-                Number(payment.amount);
-
-
-            const expectedAmount =
-                Number(
-                    savedPayment.amountKobo
-                );
-
-
-            if (
-                !Number.isSafeInteger(
-                    paystackAmount
-                ) ||
-                !Number.isSafeInteger(
-                    expectedAmount
-                ) ||
-                paystackAmount !==
-                expectedAmount
-            ) {
-
-                console.error(
-                    "Paystack amount mismatch:",
-                    {
-                        reference,
-                        paystackAmount,
-                        expectedAmount
-                    }
-                );
-
-                result = {
-                    credited: false,
-                    alreadyCredited: false,
-                    reason: "amount_mismatch"
-                };
-
-                return;
-            }
-
-
-            /* -------------------------------------------------
-               USER UID CHECK
-            ------------------------------------------------- */
 
             const uid =
                 String(
-                    savedPayment.uid || ""
+                    payment.uid ||
+                    ""
                 ).trim();
 
 
             if (!uid) {
 
-                console.error(
-                    "Payment has no user UID:",
-                    reference
-                );
-
-                result = {
-                    credited: false,
-                    alreadyCredited: false,
-                    reason: "missing_user"
+                return {
+                    success: false,
+                    reason:
+                        "Payment has no user."
                 };
-
-                return;
             }
 
 
-            /* -------------------------------------------------
-               USER WALLET
-            ------------------------------------------------- */
+            /*
+             * Duplicate protection.
+             *
+             * If the payment was already credited,
+             * NEVER add it again.
+             */
+
+            if (
+                payment.status ===
+                "credited"
+            ) {
+
+                return {
+                    success: true,
+                    alreadyCredited:
+                        true,
+                    uid,
+                    walletBalance:
+                        toFiniteNumber(
+                            payment.balanceAfter,
+                            0
+                        )
+                };
+            }
+
+
+            const savedAmountKobo =
+                toFiniteNumber(
+                    payment.amountKobo,
+                    0
+                );
+
+
+            const paystackAmountKobo =
+                toFiniteNumber(
+                    transaction.amount,
+                    0
+                );
+
+
+            /*
+             * The amount Paystack confirms MUST match
+             * the amount NovaPay originally initialized.
+             */
+
+            if (
+                savedAmountKobo <= 0
+            ) {
+
+                return {
+                    success: false,
+                    reason:
+                        "Invalid saved payment amount."
+                };
+            }
+
+
+            if (
+                paystackAmountKobo !==
+                savedAmountKobo
+            ) {
+
+                return {
+                    success: false,
+                    reason:
+                        "Payment amount mismatch."
+                };
+            }
+
+
+            const amountNaira =
+                toNairaFromKobo(
+                    savedAmountKobo
+                );
+
+
+            const amountValidation =
+                validateDepositAmount(
+                    amountNaira
+                );
+
+
+            if (
+                !amountValidation.valid
+            ) {
+
+                return {
+                    success: false,
+                    reason:
+                        amountValidation.message
+                };
+            }
+
+
+            /*
+             * Get the user's wallet document.
+             */
 
             const userRef =
                 db
-                    .collection("novapayUsers")
+                    .collection(
+                        "users"
+                    )
                     .doc(uid);
 
 
-            const userDoc =
-                await transaction.get(
+            const userSnapshot =
+                await firestoreTransaction.get(
                     userRef
                 );
 
 
-            if (!userDoc.exists) {
-                throw new Error(
-                    "NovaPay user does not exist."
-                );
+            if (
+                !userSnapshot.exists
+            ) {
+
+                return {
+                    success: false,
+                    reason:
+                        "User wallet was not found."
+                };
             }
 
 
             const user =
-                userDoc.data();
+                userSnapshot.data() ||
+                {};
 
 
             const currentBalance =
-                Number(
-                    user.walletBalance || 0
+                toFiniteNumber(
+                    user.walletBalance ??
+                    user.balance ??
+                    0,
+                    0
                 );
-
-
-            if (
-                !Number.isFinite(
-                    currentBalance
-                ) ||
-                currentBalance < 0
-            ) {
-
-                throw new Error(
-                    "Invalid existing wallet balance."
-                );
-            }
-
-
-            /* -------------------------------------------------
-               CONVERT KOBO → NAIRA
-            ------------------------------------------------- */
-
-            const amountNaira =
-                Number(
-                    (
-                        paystackAmount / 100
-                    ).toFixed(2)
-                );
-
-
-            if (
-                !Number.isFinite(
-                    amountNaira
-                ) ||
-                amountNaira <= 0
-            ) {
-
-                throw new Error(
-                    "Invalid payment amount."
-                );
-            }
 
 
             const newBalance =
@@ -367,1091 +900,276 @@ async function creditPaystackPayment(
                 );
 
 
-            if (
-                !Number.isFinite(
-                    newBalance
-                )
-            ) {
+            /*
+             * Update the canonical wallet balance.
+             */
 
-                throw new Error(
-                    "Invalid new wallet balance."
-                );
-            }
-
-
-            /* -------------------------------------------------
-               UPDATE WALLET
-            ------------------------------------------------- */
-
-            transaction.update(
+            firestoreTransaction.update(
                 userRef,
                 {
                     walletBalance:
                         newBalance,
 
                     updatedAt:
-                        FieldValue
-                            .serverTimestamp()
+                        FieldValue.serverTimestamp()
                 }
             );
 
 
-            /* -------------------------------------------------
-               SAVE NOVAPAY TRANSACTION
-            ------------------------------------------------- */
+            /*
+             * Mark the payment as credited.
+             *
+             * This is what prevents the same Paystack
+             * payment from being credited twice.
+             */
 
-            const transactionRef =
-                db
-                    .collection(
-                        "novapayTransactions"
-                    )
-                    .doc(reference);
-
-
-            transaction.set(
-                transactionRef,
-                {
-                    uid:
-                        uid,
-
-                    type:
-                        "wallet_funding",
-
-                    amount:
-                        amountNaira,
-
-                    currency:
-                        "NGN",
-
-                    reference:
-                        reference,
-
-                    status:
-                        "successful",
-
-                    paymentMethod:
-                        payment.channel ||
-                        "paystack",
-
-                    createdAt:
-                        FieldValue
-                            .serverTimestamp()
-                }
-            );
-
-
-            /* -------------------------------------------------
-               MARK PAYMENT CREDITED
-            ------------------------------------------------- */
-
-            transaction.update(
+            firestoreTransaction.update(
                 paymentRef,
                 {
                     status:
                         "credited",
 
-                    paystackStatus:
-                        payment.status,
+                    amountNaira:
+                        amountNaira,
 
-                    paystackAmount:
-                        paystackAmount,
+                    amountKobo:
+                        savedAmountKobo,
+
+                    paystackAmountKobo:
+                        paystackAmountKobo,
+
+                    balanceBefore:
+                        currentBalance,
+
+                    balanceAfter:
+                        newBalance,
 
                     creditedAt:
-                        FieldValue
-                            .serverTimestamp()
+                        FieldValue.serverTimestamp(),
+
+                    updatedAt:
+                        FieldValue.serverTimestamp()
                 }
             );
 
 
-            result = {
-                credited: true,
-                alreadyCredited: false,
-                reason: "credited",
-                uid: uid,
-                amount: amountNaira,
-                reference: reference
+            /*
+             * Save the wallet transaction.
+             */
+
+            const walletTransactionRef =
+                db
+                    .collection(
+                        "users"
+                    )
+                    .doc(uid)
+                    .collection(
+                        "transactions"
+                    )
+                    .doc(reference);
+
+
+            firestoreTransaction.set(
+                walletTransactionRef,
+                {
+                    reference:
+                        reference,
+
+                    type:
+                        "deposit",
+
+                    category:
+                        "wallet",
+
+                    description:
+                        "Wallet funding",
+
+                    amount:
+                        amountNaira,
+
+                    amountNaira:
+                        amountNaira,
+
+                    amountKobo:
+                        savedAmountKobo,
+
+                    currency:
+                        "NGN",
+
+                    direction:
+                        "credit",
+
+                    status:
+                        "successful",
+
+                    balanceBefore:
+                        currentBalance,
+
+                    balanceAfter:
+                        newBalance,
+
+                    paystackTransactionId:
+                        transaction.id ||
+                        null,
+
+                    createdAt:
+                        FieldValue.serverTimestamp(),
+
+                    updatedAt:
+                        FieldValue.serverTimestamp()
+                }
+            );
+
+
+            return {
+                success: true,
+
+                alreadyCredited:
+                    false,
+
+                uid,
+
+                walletBalance:
+                    newBalance,
+
+                amountNaira
             };
         }
     );
-
-
-    return result;
 }
 
 
 /* =========================================================
-   PAYSTACK WEBHOOK
-   ---------------------------------------------------------
-   MUST COME BEFORE express.json()
+   INITIALIZE PAYMENT
 ========================================================= */
 
 app.post(
-    "/api/payments/webhook",
-
-    express.raw({
-        type: "application/json"
-    }),
-
+    "/api/payments/initialize",
     async (req, res) => {
 
         try {
 
-            const signature =
-                req.headers[
-                    "x-paystack-signature"
-                ];
+            const decodedUser =
+                await requireUser(
+                    req
+                );
 
 
-            const secret =
-                process.env.PAYSTACK_SECRET_KEY;
+            const uid =
+                decodedUser.uid;
 
 
-            if (!secret) {
+            const amountNaira =
+                Number(
+                    req.body?.amountNaira
+                );
+
+
+            const email =
+                String(
+                    req.body?.email ||
+                    decodedUser.email ||
+                    ""
+                )
+                    .trim()
+                    .toLowerCase();
+
+
+            const validation =
+                validateDepositAmount(
+                    amountNaira
+                );
+
+
+            if (
+                !validation.valid
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        validation.message
+                });
+            }
+
+
+            if (!email) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "A valid email address is required."
+                });
+            }
+
+
+            if (
+                !PAYSTACK_SECRET_KEY
+            ) {
 
                 console.error(
                     "PAYSTACK_SECRET_KEY is missing."
                 );
 
-                return res.sendStatus(500);
-            }
-
-
-            if (!signature) {
-                return res.sendStatus(401);
-            }
-
-
-            /* -------------------------------------------------
-               VERIFY PAYSTACK SIGNATURE
-            ------------------------------------------------- */
-
-            const expectedSignature =
-                crypto
-                    .createHmac(
-                        "sha512",
-                        secret
-                    )
-                    .update(req.body)
-                    .digest("hex");
-
-
-            const signatureBuffer =
-                Buffer.from(
-                    String(signature),
-                    "utf8"
-                );
-
-
-            const expectedBuffer =
-                Buffer.from(
-                    expectedSignature,
-                    "utf8"
-                );
-
-
-            if (
-                signatureBuffer.length !==
-                expectedBuffer.length ||
-                !crypto.timingSafeEqual(
-                    signatureBuffer,
-                    expectedBuffer
-                )
-            ) {
-
-                console.warn(
-                    "Invalid Paystack webhook signature."
-                );
-
-                return res.sendStatus(401);
-            }
-
-
-            /* -------------------------------------------------
-               PARSE PAYLOAD
-            ------------------------------------------------- */
-
-            let event;
-
-
-            try {
-
-                event =
-                    JSON.parse(
-                        req.body.toString(
-                            "utf8"
-                        )
-                    );
-
-            } catch (error) {
-
-                console.error(
-                    "Invalid Paystack webhook JSON:",
-                    error
-                );
-
-                return res.sendStatus(400);
-            }
-
-
-            /* -------------------------------------------------
-               ONLY SUCCESSFUL PAYMENTS
-            ------------------------------------------------- */
-
-            if (
-                event.event !==
-                "charge.success"
-            ) {
-
-                return res.sendStatus(200);
-            }
-
-
-            const payment =
-                event.data;
-
-
-            if (!payment) {
-                return res.sendStatus(200);
-            }
-
-
-            /* -------------------------------------------------
-               CREDIT WALLET
-            ------------------------------------------------- */
-
-            const result =
-                await creditPaystackPayment(
-                    payment
-                );
-
-
-            console.log(
-                "NovaPay Paystack webhook result:",
-                result
-            );
-
-
-            return res.sendStatus(200);
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay Paystack webhook error:",
-                error
-            );
-
-            return res.sendStatus(500);
-        }
-    }
-);
-
-
-/* =========================================================
-   JSON BODY PARSER
-========================================================= */
-
-app.use(
-    express.json({
-        limit: "10kb"
-    })
-);
-
-
-/* =========================================================
-   RATE LIMIT
-========================================================= */
-
-const apiLimiter =
-    rateLimit({
-
-        windowMs:
-            15 * 60 * 1000,
-
-        limit:
-            100,
-
-        standardHeaders:
-            "draft-7",
-
-        legacyHeaders:
-            false
-    });
-
-
-app.use(apiLimiter);
-
-
-/* =========================================================
-   HEALTH CHECK
-========================================================= */
-
-app.get(
-    "/",
-    (req, res) => {
-
-        res.json({
-            success: true,
-            message:
-                "NovaPay backend is running."
-        });
-    }
-);
-
-
-/* =========================================================
-   REGISTER
-========================================================= */
-
-app.post(
-    "/api/register",
-
-    async (req, res) => {
-
-        try {
-
-            const {
-                idToken,
-                username,
-                password
-            } = req.body || {};
-
-
-            if (!idToken) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Phone verification is required."
-                });
-            }
-
-
-            if (!username) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Username is required."
-                });
-            }
-
-
-            if (!password) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Password is required."
-                });
-            }
-
-
-            const result =
-                await registerUser({
-                    idToken:
-                        idToken,
-
-                    username:
-                        username,
-
-                    password:
-                        password
-                });
-
-
-            return res.status(201).json({
-                success: true,
-
-                message:
-                    "Account created successfully.",
-
-                uid:
-                    result.uid
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Register error:",
-                error
-            );
-
-            return res.status(400).json({
-                success: false,
-
-                message:
-                    error.message ||
-                    "Unable to create account."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   LOGIN
-   PHONE NUMBER + PASSWORD
-========================================================= */
-
-app.post(
-    "/api/login",
-
-    async (req, res) => {
-
-        try {
-
-            const {
-                phone,
-                password
-            } = req.body || {};
-
-
-            if (!phone) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Phone number is required."
-                });
-            }
-
-
-            if (!password) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Password is required."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               NORMALIZE NIGERIAN PHONE
-            ------------------------------------------------- */
-
-            let normalizedPhone =
-                String(phone)
-                    .trim()
-                    .replace(/\s+/g, "")
-                    .replace(/-/g, "")
-                    .replace(/[()]/g, "");
-
-
-            if (
-                normalizedPhone.startsWith("0") &&
-                normalizedPhone.length === 11
-            ) {
-
-                normalizedPhone =
-                    "+234" +
-                    normalizedPhone.substring(1);
-            }
-
-
-            if (
-                normalizedPhone.startsWith("234") &&
-                !normalizedPhone.startsWith("+234")
-            ) {
-
-                normalizedPhone =
-                    "+" +
-                    normalizedPhone;
-            }
-
-
-            /* -------------------------------------------------
-               FIND USER
-            ------------------------------------------------- */
-
-            const userQuery =
-                await db
-                    .collection(
-                        "novapayUsers"
-                    )
-                    .where(
-                        "phoneNumber",
-                        "==",
-                        normalizedPhone
-                    )
-                    .limit(1)
-                    .get();
-
-
-            if (userQuery.empty) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Incorrect phone number or password."
-                });
-            }
-
-
-            const userDoc =
-                userQuery.docs[0];
-
-
-            const user =
-                userDoc.data();
-
-
-            if (
-                !user.passwordHash ||
-                !user.passwordSalt
-            ) {
-
-                console.error(
-                    "NovaPay login: password data missing:",
-                    userDoc.id
-                );
 
                 return res.status(500).json({
+
                     success: false,
-                    message:
-                        "This account cannot be logged in at the moment."
-                });
-            }
 
-
-            const passwordCorrect =
-                await verifyPasswordHash(
-                    password,
-                    user.passwordSalt,
-                    user.passwordHash
-                );
-
-
-            if (!passwordCorrect) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Incorrect phone number or password."
-                });
-            }
-
-
-            const uid =
-                user.uid ||
-                userDoc.id;
-
-
-            /* -------------------------------------------------
-               VERIFY FIREBASE USER EXISTS
-            ------------------------------------------------- */
-
-            try {
-
-                await auth.getUser(
-                    uid
-                );
-
-            } catch (error) {
-
-                console.error(
-                    "NovaPay login: Firebase user not found:",
-                    error
-                );
-
-                return res.status(500).json({
-                    success: false,
-                    message:
-                        "Your authentication account could not be found."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               CREATE FIREBASE CUSTOM TOKEN
-            ------------------------------------------------- */
-
-            const customToken =
-                await auth.createCustomToken(
-                    uid,
-                    {
-                        novaPayUser:
-                            true
-                    }
-                );
-
-
-            return res.status(200).json({
-
-                success:
-                    true,
-
-                message:
-                    "Login successful.",
-
-                token:
-                    customToken,
-
-                user: {
-
-                    uid:
-                        uid,
-
-                    username:
-                        user.username ||
-                        "",
-
-                    phoneNumber:
-                        user.phoneNumber ||
-                        "",
-
-                    phoneVerified:
-                        user.phoneVerified ===
-                        true
-                }
-            });
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay login error:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Unable to process your login right now."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   RESET PASSWORD
-========================================================= */
-
-app.post(
-    "/api/reset-password",
-
-    async (req, res) => {
-
-        try {
-
-            const {
-                idToken,
-                newPassword
-            } = req.body || {};
-
-
-            if (!idToken) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Verification is required."
-                });
-            }
-
-
-            if (!newPassword) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "New password is required."
-                });
-            }
-
-
-            if (
-                typeof newPassword !==
-                    "string" ||
-                newPassword.length < 6
-            ) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Password must be at least 6 characters."
-                });
-            }
-
-
-            let decodedToken;
-
-
-            try {
-
-                decodedToken =
-                    await auth.verifyIdToken(
-                        idToken
-                    );
-
-            } catch (error) {
-
-                console.error(
-                    "Reset password token verification failed:",
-                    error
-                );
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Your verification has expired. Please try again."
-                });
-            }
-
-
-            const uid =
-                decodedToken.uid;
-
-
-            const passwordHash =
-                await hashPassword(
-                    newPassword
-                );
-
-
-            await db
-                .collection(
-                    "novapayUsers"
-                )
-                .doc(uid)
-                .update({
-
-                    passwordHash:
-                        passwordHash,
-
-                    updatedAt:
-                        FieldValue
-                            .serverTimestamp()
-                });
-
-
-            return res.status(200).json({
-                success: true,
-                message:
-                    "Password updated successfully."
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Reset password error:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "We couldn't update your password right now. Please try again."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   PAYSTACK INITIALIZATION
-   WALLET FUNDING
-========================================================= */
-
-app.post(
-    "/api/payments/initialize",
-
-    async (req, res) => {
-
-        try {
-
-            /* -------------------------------------------------
-               AUTHENTICATION
-            ------------------------------------------------- */
-
-            const authHeader =
-                req.headers.authorization ||
-                "";
-
-
-            if (
-                !authHeader.startsWith(
-                    "Bearer "
-                )
-            ) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication is required."
-                });
-            }
-
-
-            const idToken =
-                authHeader
-                    .substring(7)
-                    .trim();
-
-
-            if (!idToken) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication is required."
-                });
-            }
-
-
-            let decodedToken;
-
-
-            try {
-
-                decodedToken =
-                    await auth.verifyIdToken(
-                        idToken
-                    );
-
-            } catch (error) {
-
-                console.error(
-                    "Payment Firebase token verification failed:",
-                    error
-                );
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Your session has expired. Please log in again."
-                });
-            }
-
-
-            const uid =
-                decodedToken.uid;
-
-
-            /* -------------------------------------------------
-               IMPORTANT:
-               FRONTEND MUST SEND amountNaira.
-
-               Example:
-               ₦500 = amountNaira: 500
-
-               The server converts this ONCE to:
-               50000 kobo.
-            ------------------------------------------------- */
-
-            const {
-                amountNaira,
-                email
-            } = req.body || {};
-
-
-            const amountNumber =
-                Number(amountNaira);
-
-
-            const normalizedEmail =
-                String(email || "")
-                    .trim()
-                    .toLowerCase();
-
-
-            /* -------------------------------------------------
-               VALIDATE AMOUNT
-            ------------------------------------------------- */
-
-            if (
-                !Number.isFinite(
-                    amountNumber
-                ) ||
-                amountNumber < 100
-            ) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Enter a valid amount of at least ₦100."
-                });
-            }
-
-
-            if (
-                amountNumber > 1000000
-            ) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "The payment amount is too large."
-                });
-            }
-
-
-            if (
-                Math.round(
-                    amountNumber * 100
-                ) !==
-                amountNumber * 100
-            ) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Enter a valid amount."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               VALIDATE EMAIL
-            ------------------------------------------------- */
-
-            const emailPattern =
-                /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-
-            if (
-                !emailPattern.test(
-                    normalizedEmail
-                )
-            ) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Enter a valid email address."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               PAYSTACK SECRET
-            ------------------------------------------------- */
-
-            const paystackSecret =
-                process.env.PAYSTACK_SECRET_KEY;
-
-
-            if (!paystackSecret) {
-
-                console.error(
-                    "PAYSTACK_SECRET_KEY is not configured."
-                );
-
-                return res.status(500).json({
-                    success: false,
                     message:
                         "Payment service is temporarily unavailable."
                 });
             }
 
 
-            /* -------------------------------------------------
-               VERIFY NOVAPAY USER
-            ------------------------------------------------- */
-
-            const userRef =
-                db
-                    .collection(
-                        "novapayUsers"
-                    )
-                    .doc(uid);
-
-
-            const userDoc =
-                await userRef.get();
-
-
-            if (!userDoc.exists) {
-
-                return res.status(404).json({
-                    success: false,
-                    message:
-                        "NovaPay account not found."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               NAIRA → KOBO
-               THIS IS THE ONLY CONVERSION.
-            ------------------------------------------------- */
-
             const amountKobo =
-                Math.round(
-                    amountNumber * 100
+                toKoboFromNaira(
+                    validation.amount
                 );
 
 
-            if (
-                !Number.isSafeInteger(
-                    amountKobo
-                )
-            ) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid payment amount."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               UNIQUE REFERENCE
-            ------------------------------------------------- */
-
             const reference =
-                `NP-${uid}-${Date.now()}-${crypto
-                    .randomBytes(8)
-                    .toString("hex")}`;
+                createPaymentReference();
 
 
-            /* -------------------------------------------------
-               SAVE PENDING PAYMENT
-            ------------------------------------------------- */
-
-            await db
-                .collection(
-                    "novapayPayments"
-                )
-                .doc(reference)
-                .set({
-
-                    uid:
-                        uid,
-
-                    email:
-                        normalizedEmail,
-
-                    amountNaira:
-                        Number(
-                            amountNumber.toFixed(2)
-                        ),
-
-                    amountKobo:
-                        amountKobo,
-
-                    currency:
-                        "NGN",
-
-                    reference:
-                        reference,
-
-                    status:
-                        "pending",
-
-                    provider:
-                        "paystack",
-
-                    createdAt:
-                        FieldValue
-                            .serverTimestamp()
-                });
+            const paymentRef =
+                db
+                    .collection(
+                        "novapayPayments"
+                    )
+                    .doc(reference);
 
 
-            /* -------------------------------------------------
-               INITIALIZE PAYSTACK
-            ------------------------------------------------- */
+            await paymentRef.set({
+
+                reference,
+
+                uid,
+
+                email,
+
+                amountNaira:
+                    validation.amount,
+
+                amountKobo,
+
+                currency:
+                    "NGN",
+
+                status:
+                    "initialized",
+
+                createdAt:
+                    FieldValue.serverTimestamp(),
+
+                updatedAt:
+                    FieldValue.serverTimestamp()
+            });
+
 
             let paystackResponse;
 
@@ -1468,8 +1186,8 @@ app.post(
 
                             headers: {
 
-                                "Authorization":
-                                    `Bearer ${paystackSecret}`,
+                                Authorization:
+                                    `Bearer ${PAYSTACK_SECRET_KEY}`,
 
                                 "Content-Type":
                                     "application/json"
@@ -1478,47 +1196,15 @@ app.post(
                             body:
                                 JSON.stringify({
 
-                                    email:
-                                        normalizedEmail,
+                                    email,
 
-                                    /* Paystack receives KOBO */
                                     amount:
-                                        String(
-                                            amountKobo
-                                        ),
+                                        amountKobo,
 
-                                    currency:
-                                        "NGN",
+                                    reference,
 
-                                    reference:
-                                        reference,
-
-                                    /*
-                                       Paystack returns the user
-                                       to this page after checkout.
-
-                                       The reference will be appended
-                                       by Paystack.
-                                    */
                                     callback_url:
-    "https://lordlowkey-ma.github.io/NovaPay1/dashboard.html",
-
-                                    channels: [
-                                        "card",
-                                        "bank_transfer"
-                                    ],
-
-                                    metadata: {
-
-                                        uid:
-                                            uid,
-
-                                        type:
-                                            "wallet_funding",
-
-                                        novaPayReference:
-                                            reference
-                                    }
+                                        `${FRONTEND_URL}/add-money.html`
                                 })
                         }
                     );
@@ -1526,38 +1212,30 @@ app.post(
             } catch (error) {
 
                 console.error(
-                    "Paystack API connection error:",
+                    "Paystack connection error:",
                     error
                 );
 
 
-                await db
-                    .collection(
-                        "novapayPayments"
-                    )
-                    .doc(reference)
-                    .update({
+                await paymentRef.update({
 
-                        status:
-                            "initialization_failed",
+                    status:
+                        "initialization_failed",
 
-                        updatedAt:
-                            FieldValue
-                                .serverTimestamp()
-                    });
+                    updatedAt:
+                        FieldValue.serverTimestamp()
+                });
 
 
                 return res.status(502).json({
+
                     success: false,
+
                     message:
-                        "We couldn't connect to the payment service. Please try again."
+                        "Unable to contact the payment service."
                 });
             }
 
-
-            /* -------------------------------------------------
-               READ PAYSTACK RESPONSE
-            ------------------------------------------------- */
 
             let paystackData;
 
@@ -1569,39 +1247,25 @@ app.post(
 
             } catch (error) {
 
-                console.error(
-                    "Invalid Paystack response:",
-                    error
-                );
+                await paymentRef.update({
 
+                    status:
+                        "initialization_failed",
 
-                await db
-                    .collection(
-                        "novapayPayments"
-                    )
-                    .doc(reference)
-                    .update({
-
-                        status:
-                            "initialization_failed",
-
-                        updatedAt:
-                            FieldValue
-                                .serverTimestamp()
-                    });
+                    updatedAt:
+                        FieldValue.serverTimestamp()
+                });
 
 
                 return res.status(502).json({
+
                     success: false,
+
                     message:
-                        "The payment service returned an invalid response."
+                        "Invalid response from payment service."
                 });
             }
 
-
-            /* -------------------------------------------------
-               PAYSTACK ERROR
-            ------------------------------------------------- */
 
             if (
                 !paystackResponse.ok ||
@@ -1615,264 +1279,111 @@ app.post(
                 );
 
 
-                await db
-                    .collection(
-                        "novapayPayments"
-                    )
-                    .doc(reference)
-                    .update({
-
-                        status:
-                            "initialization_failed",
-
-                        paystackResponse:
-                            paystackData,
-
-                        updatedAt:
-                            FieldValue
-                                .serverTimestamp()
-                    });
-
-
-                return res.status(502).json({
-                    success: false,
-                    message:
-                        "We couldn't start your payment. Please try again."
-                });
-            }
-
-
-            const paymentData =
-                paystackData.data;
-
-
-            /* -------------------------------------------------
-               VALIDATE CHECKOUT DATA
-            ------------------------------------------------- */
-
-            if (
-                !paymentData.authorization_url ||
-                !paymentData.reference
-            ) {
-
-                console.error(
-                    "Paystack returned incomplete payment data:",
-                    paymentData
-                );
-
-
-                await db
-                    .collection(
-                        "novapayPayments"
-                    )
-                    .doc(reference)
-                    .update({
-
-                        status:
-                            "initialization_failed",
-
-                        updatedAt:
-                            FieldValue
-                                .serverTimestamp()
-                    });
-
-
-                return res.status(502).json({
-                    success: false,
-                    message:
-                        "Paystack did not return a valid checkout."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               REFERENCE MUST MATCH
-            ------------------------------------------------- */
-
-            if (
-                paymentData.reference !==
-                reference
-            ) {
-
-                console.error(
-                    "Paystack reference mismatch during initialization:",
-                    reference,
-                    paymentData.reference
-                );
-
-
-                await db
-                    .collection(
-                        "novapayPayments"
-                    )
-                    .doc(reference)
-                    .update({
-
-                        status:
-                            "initialization_failed",
-
-                        updatedAt:
-                            FieldValue
-                                .serverTimestamp()
-                    });
-
-
-                return res.status(502).json({
-                    success: false,
-                    message:
-                        "Payment reference verification failed."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               SAVE PAYSTACK DETAILS
-            ------------------------------------------------- */
-
-            await db
-                .collection(
-                    "novapayPayments"
-                )
-                .doc(reference)
-                .update({
-
-                    accessCode:
-                        paymentData.access_code ||
-                        null,
-
-                    authorizationUrl:
-                        paymentData.authorization_url,
-
-                    paystackReference:
-                        paymentData.reference,
+                await paymentRef.update({
 
                     status:
-                        "initialized",
+                        "initialization_failed",
+
+                    paystackResponse:
+                        paystackData,
 
                     updatedAt:
-                        FieldValue
-                            .serverTimestamp()
+                        FieldValue.serverTimestamp()
                 });
 
 
-            /* -------------------------------------------------
-               RETURN CHECKOUT URL
-            ------------------------------------------------- */
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        paystackData?.message ||
+                        "Unable to initialize payment."
+                });
+            }
+
+
+            await paymentRef.update({
+
+                status:
+                    "pending",
+
+                authorizationUrl:
+                    paystackData.data.authorization_url,
+
+                accessCode:
+                    paystackData.data.access_code,
+
+                updatedAt:
+                    FieldValue.serverTimestamp()
+            });
+
 
             return res.status(200).json({
 
-                success:
-                    true,
+                success: true,
+
+                reference,
 
                 authorization_url:
-                    paymentData.authorization_url,
+                    paystackData.data.authorization_url,
 
-                reference:
-                    paymentData.reference
+                access_code:
+                    paystackData.data.access_code,
+
+                amountNaira:
+                    validation.amount,
+
+                amountKobo
             });
-
 
         } catch (error) {
 
             console.error(
-                "NovaPay payment initialization error:",
+                "Payment initialization error:",
                 error
             );
 
 
-            return res.status(500).json({
+            const statusCode =
+                error.statusCode ||
+                500;
+
+
+            return res.status(
+                statusCode
+            ).json({
+
                 success: false,
+
                 message:
-                    "We couldn't start your payment right now."
+                    statusCode === 401
+                        ? "Your session has expired. Please log in again."
+                        : "Unable to initialize payment."
             });
         }
     }
 );
-
-
 /* =========================================================
-   VERIFY PAYSTACK PAYMENT
-   SERVER-SIDE VERIFICATION
+   VERIFY PAYMENT
+   ---------------------------------------------------------
+   Paystack is checked directly from the server.
+   The browser cannot declare a payment successful.
 ========================================================= */
 
 app.get(
     "/api/payments/verify/:reference",
-
     async (req, res) => {
 
         try {
 
-            /* -------------------------------------------------
-               AUTHENTICATION
-            ------------------------------------------------- */
-
-            const authHeader =
-                req.headers.authorization ||
-                "";
-
-
-            if (
-                !authHeader.startsWith(
-                    "Bearer "
-                )
-            ) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication is required."
-                });
-            }
-
-
-            const idToken =
-                authHeader
-                    .substring(7)
-                    .trim();
-
-
-            if (!idToken) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication is required."
-                });
-            }
-
-
-            let decodedToken;
-
-
-            try {
-
-                decodedToken =
-                    await auth.verifyIdToken(
-                        idToken
-                    );
-
-            } catch (error) {
-
-                console.error(
-                    "Payment verification token failed:",
-                    error
-                );
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Your session has expired. Please log in again."
-                });
-            }
+            const decodedUser =
+                await requireUser(req);
 
 
             const uid =
-                decodedToken.uid;
+                decodedUser.uid;
 
-
-            /* -------------------------------------------------
-               REFERENCE
-            ------------------------------------------------- */
 
             const reference =
                 String(
@@ -1881,22 +1392,17 @@ app.get(
                 ).trim();
 
 
-            if (
-                !reference ||
-                reference.length > 200
-            ) {
+            if (!reference) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Invalid payment reference."
+                        "Payment reference is required."
                 });
             }
 
-
-            /* -------------------------------------------------
-               FIND NOVAPAY PAYMENT
-            ------------------------------------------------- */
 
             const paymentRef =
                 db
@@ -1906,14 +1412,18 @@ app.get(
                     .doc(reference);
 
 
-            const paymentDoc =
+            const paymentSnapshot =
                 await paymentRef.get();
 
 
-            if (!paymentDoc.exists) {
+            if (
+                !paymentSnapshot.exists
+            ) {
 
                 return res.status(404).json({
+
                     success: false,
+
                     message:
                         "Payment record not found."
                 });
@@ -1921,39 +1431,51 @@ app.get(
 
 
             const savedPayment =
-                paymentDoc.data();
+                paymentSnapshot.data() ||
+                {};
 
 
-            /* -------------------------------------------------
-               USER OWNERSHIP CHECK
-            ------------------------------------------------- */
+            /*
+             * Make sure the authenticated user owns
+             * this payment.
+             */
 
             if (
-                savedPayment.uid !==
-                uid
+                String(
+                    savedPayment.uid ||
+                    ""
+                ) !== uid
             ) {
 
                 return res.status(403).json({
+
                     success: false,
+
                     message:
-                        "You are not authorized to verify this payment."
+                        "This payment does not belong to your account."
                 });
             }
 
 
-            /* -------------------------------------------------
-               ALREADY CREDITED
-            ------------------------------------------------- */
+            /*
+             * If the webhook already credited this payment,
+             * simply return the fresh wallet balance.
+             */
 
             if (
                 savedPayment.status ===
                 "credited"
             ) {
 
+                const walletBalance =
+                    await getWalletBalance(
+                        uid
+                    );
+
+
                 return res.status(200).json({
 
-                    success:
-                        true,
+                    success: true,
 
                     status:
                         "credited",
@@ -1961,44 +1483,44 @@ app.get(
                     alreadyCredited:
                         true,
 
-                    reference:
-                        reference
+                    reference,
+
+                    amountNaira:
+                        toFiniteNumber(
+                            savedPayment.amountNaira,
+                            0
+                        ),
+
+                    walletBalance
                 });
             }
 
 
-            /* -------------------------------------------------
-               PAYSTACK SECRET
-            ------------------------------------------------- */
-
-            const paystackSecret =
-                process.env.PAYSTACK_SECRET_KEY;
-
-
-            if (!paystackSecret) {
+            if (
+                !PAYSTACK_SECRET_KEY
+            ) {
 
                 console.error(
-                    "PAYSTACK_SECRET_KEY is not configured."
+                    "PAYSTACK_SECRET_KEY is missing."
                 );
 
+
                 return res.status(500).json({
+
                     success: false,
+
                     message:
                         "Payment service is temporarily unavailable."
                 });
             }
 
 
-            /* -------------------------------------------------
-               VERIFY WITH PAYSTACK
-            ------------------------------------------------- */
-
-            let verifyResponse;
+            let paystackResponse;
 
 
             try {
 
-                verifyResponse =
+                paystackResponse =
                     await fetch(
                         `https://api.paystack.co/transaction/verify/${encodeURIComponent(
                             reference
@@ -2010,8 +1532,8 @@ app.get(
 
                             headers: {
 
-                                "Authorization":
-                                    `Bearer ${paystackSecret}`,
+                                Authorization:
+                                    `Bearer ${PAYSTACK_SECRET_KEY}`,
 
                                 "Content-Type":
                                     "application/json"
@@ -2026,164 +1548,227 @@ app.get(
                     error
                 );
 
+
                 return res.status(502).json({
+
                     success: false,
+
                     message:
-                        "We couldn't verify the payment right now."
+                        "Unable to contact the payment service."
                 });
             }
 
 
-            /* -------------------------------------------------
-               READ VERIFICATION RESPONSE
-            ------------------------------------------------- */
-
-            let verifyData;
+            let paystackData;
 
 
             try {
 
-                verifyData =
-                    await verifyResponse.json();
+                paystackData =
+                    await paystackResponse.json();
 
             } catch (error) {
 
+                console.error(
+                    "Invalid Paystack verification response:",
+                    error
+                );
+
+
                 return res.status(502).json({
+
                     success: false,
+
                     message:
-                        "The payment service returned an invalid verification response."
+                        "Invalid response from payment service."
                 });
             }
 
 
             if (
-                !verifyResponse.ok ||
-                !verifyData.status ||
-                !verifyData.data
+                !paystackResponse.ok ||
+                !paystackData.status ||
+                !paystackData.data
             ) {
 
                 console.error(
                     "Paystack verification failed:",
-                    verifyData
+                    paystackData
                 );
 
-                return res.status(502).json({
+
+                return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Paystack could not verify this payment."
+                        "Unable to verify this payment."
                 });
             }
 
 
-            const payment =
-                verifyData.data;
+            const transaction =
+                paystackData.data;
 
 
-            /* -------------------------------------------------
-               REFERENCE MUST MATCH
-            ------------------------------------------------- */
+            /*
+             * Reference must match exactly.
+             */
 
             if (
-                payment.reference !==
-                reference
+                String(
+                    transaction.reference ||
+                    ""
+                ) !== reference
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Payment reference verification failed."
                 });
             }
 
 
-            /* -------------------------------------------------
-               CREDIT USING THE SAME SAFE FUNCTION
-            ------------------------------------------------- */
+            /*
+             * Only a successful Paystack transaction
+             * can credit the wallet.
+             */
 
-            const result =
-                await creditPaystackPayment(
-                    payment,
-                    reference
+            if (
+                transaction.status !==
+                "success"
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    status:
+                        transaction.status ||
+                        "pending",
+
+                    message:
+                        "This payment has not been completed."
+                });
+            }
+
+
+            /*
+             * Currency must be NGN.
+             */
+
+            if (
+                String(
+                    transaction.currency ||
+                    ""
+                ).toUpperCase() !==
+                "NGN"
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Invalid payment currency."
+                });
+            }
+
+
+            /*
+             * Credit the payment using the same
+             * duplicate-safe function used by the webhook.
+             */
+
+            const creditResult =
+                await creditPayment(
+                    reference,
+                    transaction
                 );
 
 
             if (
-                result.credited
+                !creditResult.success
             ) {
 
-                return res.status(200).json({
+                return res.status(400).json({
 
-                    success:
-                        true,
+                    success: false,
 
                     status:
-                        "credited",
+                        "failed",
 
-                    credited:
-                        true,
-
-                    amount:
-                        result.amount,
-
-                    reference:
-                        reference
+                    message:
+                        creditResult.reason ||
+                        "Payment could not be credited."
                 });
             }
 
 
-            if (
-                result.alreadyCredited
-            ) {
+            /*
+             * Read Firestore again after the credit.
+             *
+             * This is important:
+             * the dashboard and payment response use
+             * the actual wallet balance stored in Firestore.
+             */
 
-                return res.status(200).json({
-
-                    success:
-                        true,
-
-                    status:
-                        "credited",
-
-                    alreadyCredited:
-                        true,
-
-                    reference:
-                        reference
-                });
-            }
+            const walletBalance =
+                await getWalletBalance(
+                    uid
+                );
 
 
             return res.status(200).json({
 
-                success:
-                    true,
+                success: true,
 
                 status:
-                    payment.status ||
-                    "pending",
+                    "credited",
 
-                credited:
-                    false,
+                alreadyCredited:
+                    Boolean(
+                        creditResult.alreadyCredited
+                    ),
 
-                reference:
-                    reference,
+                reference,
 
-                message:
-                    "Payment has not been confirmed as successful yet."
+                amountNaira:
+                    toFiniteNumber(
+                        creditResult.amountNaira ??
+                        savedPayment.amountNaira,
+                        0
+                    ),
+
+                walletBalance
             });
-
 
         } catch (error) {
 
             console.error(
-                "NovaPay payment verification error:",
+                "Payment verification error:",
                 error
             );
 
 
-            return res.status(500).json({
+            const statusCode =
+                error.statusCode ||
+                500;
+
+
+            return res.status(
+                statusCode
+            ).json({
+
                 success: false,
+
                 message:
-                    "We couldn't verify your payment right now."
+                    statusCode === 401
+                        ? "Your session has expired. Please log in again."
+                        : "Unable to verify your payment."
             });
         }
     }
@@ -2191,21 +1776,459 @@ app.get(
 
 
 /* =========================================================
-   SERVER START
+   PAYMENT STATUS
 ========================================================= */
 
-const PORT =
-    process.env.PORT || 3000;
+app.get(
+    "/api/payments/status/:reference",
+    async (req, res) => {
 
+        try {
+
+            const decodedUser =
+                await requireUser(req);
+
+
+            const uid =
+                decodedUser.uid;
+
+
+            const reference =
+                String(
+                    req.params.reference ||
+                    ""
+                ).trim();
+
+
+            if (!reference) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Payment reference is required."
+                });
+            }
+
+
+            const paymentSnapshot =
+                await db
+                    .collection(
+                        "novapayPayments"
+                    )
+                    .doc(reference)
+                    .get();
+
+
+            if (
+                !paymentSnapshot.exists
+            ) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "Payment record not found."
+                });
+            }
+
+
+            const payment =
+                paymentSnapshot.data() ||
+                {};
+
+
+            /*
+             * Payment ownership check.
+             */
+
+            if (
+                String(
+                    payment.uid ||
+                    ""
+                ) !== uid
+            ) {
+
+                return res.status(403).json({
+
+                    success: false,
+
+                    message:
+                        "This payment does not belong to your account."
+                });
+            }
+
+
+            /*
+             * Always read the current balance from
+             * Firestore rather than trusting an old
+             * payment response.
+             */
+
+            const walletBalance =
+                await getWalletBalance(
+                    uid
+                );
+
+
+            return res.status(200).json({
+
+                success: true,
+
+                reference,
+
+                status:
+                    payment.status ||
+                    "pending",
+
+                amountNaira:
+                    toFiniteNumber(
+                        payment.amountNaira ??
+                        toNairaFromKobo(
+                            payment.amountKobo
+                        ),
+                        0
+                    ),
+
+                amountKobo:
+                    toFiniteNumber(
+                        payment.amountKobo,
+                        0
+                    ),
+
+                currency:
+                    payment.currency ||
+                    "NGN",
+
+                walletBalance
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Payment status error:",
+                error
+            );
+
+
+            const statusCode =
+                error.statusCode ||
+                500;
+
+
+            return res.status(
+                statusCode
+            ).json({
+
+                success: false,
+
+                message:
+                    statusCode === 401
+                        ? "Your session has expired. Please log in again."
+                        : "Unable to check payment status."
+            });
+        }
+    }
+);
+
+
+/* =========================================================
+   DASHBOARD
+   ---------------------------------------------------------
+   Returns the current wallet balance directly from
+   Firestore every time.
+========================================================= */
+
+app.get(
+    "/api/dashboard",
+    async (req, res) => {
+
+        try {
+
+            const decodedUser =
+                await requireUser(req);
+
+
+            const uid =
+                decodedUser.uid;
+
+
+            const user =
+                await getUserDocument(
+                    uid
+                );
+
+
+            const walletBalance =
+                toFiniteNumber(
+                    user.data.walletBalance ??
+                    user.data.balance ??
+                    0,
+                    0
+                );
+
+
+            /*
+             * Load recent transactions.
+             */
+
+            let recentTransactions =
+                [];
+
+
+            try {
+
+                const transactionSnapshot =
+                    await db
+                        .collection(
+                            "users"
+                        )
+                        .doc(uid)
+                        .collection(
+                            "transactions"
+                        )
+                        .orderBy(
+                            "createdAt",
+                            "desc"
+                        )
+                        .limit(10)
+                        .get();
+
+
+                recentTransactions =
+                    transactionSnapshot.docs.map(
+                        (doc) => {
+
+                            const data =
+                                doc.data() ||
+                                {};
+
+
+                            return {
+
+                                id:
+                                    doc.id,
+
+                                ...data
+                            };
+                        }
+                    );
+
+            } catch (error) {
+
+                /*
+                 * If the transaction query fails because
+                 * an index is unavailable, the dashboard
+                 * balance should still work.
+                 */
+
+                console.warn(
+                    "Recent transaction query failed:",
+                    error.message
+                );
+            }
+
+
+            return res.status(200).json({
+
+                success: true,
+
+                balance:
+                    walletBalance,
+
+                walletBalance,
+
+                user: {
+
+                    uid,
+
+                    email:
+                        decodedUser.email ||
+                        user.data.email ||
+                        "",
+
+                    displayName:
+                        user.data.displayName ||
+                        decodedUser.name ||
+                        "",
+
+                    walletBalance
+                },
+
+                transactions:
+                    recentTransactions,
+
+                recentTransactions
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Dashboard error:",
+                error
+            );
+
+
+            const statusCode =
+                error.statusCode ||
+                500;
+
+
+            return res.status(
+                statusCode
+            ).json({
+
+                success: false,
+
+                message:
+                    statusCode === 401
+                        ? "Your session has expired. Please log in again."
+                        : "Unable to load dashboard."
+            });
+        }
+    }
+);
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
+
+app.get(
+    "/health",
+    (req, res) => {
+
+        return res.status(200).json({
+
+            success: true,
+
+            service:
+                "NovaPay Backend",
+
+            status:
+                "online",
+
+            timestamp:
+                new Date().toISOString()
+        });
+    }
+);
+
+
+/* =========================================================
+   ROOT
+========================================================= */
+
+app.get(
+    "/",
+    (req, res) => {
+
+        return res.status(200).json({
+
+            success: true,
+
+            service:
+                "NovaPay Backend",
+
+            status:
+                "online"
+        });
+    }
+);
+
+
+/* =========================================================
+   404 HANDLER
+========================================================= */
+
+app.use(
+    (req, res) => {
+
+        return res.status(404).json({
+
+            success: false,
+
+            message:
+                "Endpoint not found."
+        });
+    }
+);
+
+
+/* =========================================================
+   GLOBAL ERROR HANDLER
+========================================================= */
+
+app.use(
+    (error, req, res, next) => {
+
+        console.error(
+            "NovaPay server error:",
+            error
+        );
+
+
+        if (
+            res.headersSent
+        ) {
+
+            return next(error);
+        }
+
+
+        return res.status(
+            error.statusCode || 500
+        ).json({
+
+            success: false,
+
+            message:
+                error.statusCode === 401
+                    ? "Your session has expired. Please log in again."
+                    : "An unexpected server error occurred."
+        });
+    }
+);
+
+
+/* =========================================================
+   START SERVER
+========================================================= */
 
 app.listen(
     PORT,
-    "0.0.0.0",
     () => {
 
         console.log(
-            `NovaPay backend running on port ${PORT}`
+            "=========================================="
         );
 
+        console.log(
+            "NovaPay Backend Started"
+        );
+
+        console.log(
+            `Port: ${PORT}`
+        );
+
+        console.log(
+            `Frontend: ${FRONTEND_URL}`
+        );
+
+        console.log(
+            `Minimum deposit: ₦${MIN_DEPOSIT_NAIRA}`
+        );
+
+        console.log(
+            `Maximum deposit: ₦${MAX_DEPOSIT_NAIRA.toLocaleString("en-NG")}`
+        );
+
+        console.log(
+            "Paystack: configured"
+        );
+
+        console.log(
+            "=========================================="
+        );
     }
-);
+);node --
